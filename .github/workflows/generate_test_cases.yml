@@ -1,0 +1,83 @@
+name: Generate Test Cases
+
+on:
+  workflow_dispatch:
+    inputs:
+      jira_task_id:
+        description: "Jira Task ID (e.g. QCT-42)"
+        required: true
+        type: string
+      requirements:
+        description: "Paste the task requirements / acceptance criteria"
+        required: true
+        type: string
+  repository_dispatch:
+    types: [jira_task_to_qa]
+
+jobs:
+  generate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Resolve inputs (dispatch vs manual)
+        id: inputs
+        run: |
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            echo "jira_task_id=${{ github.event.client_payload.jira_task_id }}" >> $GITHUB_OUTPUT
+            # Write multi-line requirements from payload
+            python3 -c "
+          import os, json
+          payload = json.loads(os.environ['PAYLOAD'])
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('requirements<<EOF\n')
+              f.write(payload['requirements'] + '\n')
+              f.write('EOF\n')
+          "
+          else
+            echo "jira_task_id=${{ github.event.inputs.jira_task_id }}" >> $GITHUB_OUTPUT
+            {
+              echo 'requirements<<EOF'
+              echo "${{ github.event.inputs.requirements }}"
+              echo 'EOF'
+            } >> $GITHUB_OUTPUT
+          fi
+        env:
+          PAYLOAD: ${{ toJson(github.event.client_payload) }}
+
+      - name: Generate test cases via Claude
+        id: generate
+        run: |
+          python3 scripts/generate_test_cases.py \
+            --jira-task "${{ steps.inputs.outputs.jira_task_id }}" \
+            --requirements "${{ steps.inputs.outputs.requirements }}" \
+            --output test_cases.json
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+      - name: Upload test cases artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-cases-${{ github.run_id }}
+          path: test_cases.json
+          retention-days: 7
+
+      - name: Post test cases to Slack for review
+        run: |
+          python3 scripts/post_to_slack.py \
+            --test-cases test_cases.json \
+            --jira-task "${{ steps.inputs.outputs.jira_task_id }}" \
+            --run-id "${{ github.run_id }}" \
+            --repo "${{ github.repository }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
