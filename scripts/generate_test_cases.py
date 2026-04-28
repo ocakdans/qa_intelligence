@@ -12,6 +12,8 @@ import anthropic
 SYSTEM_PROMPT = """You are a senior QA engineer. Given a Jira task ID and its requirements,
 generate comprehensive test cases covering happy paths, edge cases, and negative scenarios.
 
+Generate a MAXIMUM of 5 test cases. Prioritize the most important scenarios.
+
 Return ONLY valid JSON — no markdown fences, no extra text — in this exact structure:
 {
   "jira_task_id": "<task_id>",

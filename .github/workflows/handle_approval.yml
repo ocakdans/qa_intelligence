@@ -3,8 +3,9 @@ name: Handle Slack Approval
 on:
   repository_dispatch:
     types:
-      - slack_approve
-      - slack_reject
+      - slack_approve_tc
+      - slack_reject_tc
+      - slack_push_to_zephyr
       - slack_add_test_case
       - slack_create_test_run
       - slack_skip_test_run
@@ -24,17 +25,67 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── APPROVE ──────────────────────────────────────────────────────────────
+      # ── DOWNLOAD ARTIFACT (needed for most actions) ───────────────────────
       - name: Download test cases artifact
-        if: github.event.action == 'slack_approve' || github.event.action == 'slack_add_test_case' || github.event.action == 'slack_create_test_run'
+        if: >
+          github.event.action == 'slack_approve_tc' ||
+          github.event.action == 'slack_reject_tc' ||
+          github.event.action == 'slack_push_to_zephyr' ||
+          github.event.action == 'slack_add_test_case' ||
+          github.event.action == 'slack_create_test_run'
         uses: actions/download-artifact@v4
         with:
           name: test-cases-${{ github.event.client_payload.run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.client_payload.run_id }}
 
-      - name: Push test cases to Zephyr
-        if: github.event.action == 'slack_approve'
+      # ── APPROVE INDIVIDUAL TEST CASE ─────────────────────────────────────
+      - name: Mark test case as approved
+        if: github.event.action == 'slack_approve_tc'
+        run: |
+          python3 scripts/manage_test_case.py \
+            --test-cases test_cases.json \
+            --action approve \
+            --tc-id "${{ github.event.client_payload.tc_id }}" \
+            --output test_cases.json
+
+      # ── REJECT INDIVIDUAL TEST CASE ──────────────────────────────────────
+      - name: Mark test case as rejected
+        if: github.event.action == 'slack_reject_tc'
+        run: |
+          python3 scripts/manage_test_case.py \
+            --test-cases test_cases.json \
+            --action reject \
+            --tc-id "${{ github.event.client_payload.tc_id }}" \
+            --output test_cases.json
+
+      # ── RE-UPLOAD + REFRESH SLACK (after approve or reject) ──────────────
+      - name: Re-upload artifact after TC change
+        if: github.event.action == 'slack_approve_tc' || github.event.action == 'slack_reject_tc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-cases-${{ github.event.client_payload.run_id }}
+          path: test_cases.json
+          overwrite: true
+          retention-days: 7
+
+      - name: Refresh Slack message after TC change
+        if: github.event.action == 'slack_approve_tc' || github.event.action == 'slack_reject_tc'
+        run: |
+          python3 scripts/post_to_slack.py \
+            --mode review \
+            --test-cases test_cases.json \
+            --jira-task "${{ github.event.client_payload.jira_task_id }}" \
+            --run-id "${{ github.event.client_payload.run_id }}" \
+            --message-ts "${{ github.event.client_payload.message_ts }}" \
+            --repo "${{ github.repository }}"
+        env:
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
+      # ── PUSH APPROVED TO ZEPHYR ──────────────────────────────────────────
+      - name: Push approved test cases to Zephyr
+        if: github.event.action == 'slack_push_to_zephyr'
         run: |
           python3 scripts/push_to_zephyr.py \
             --test-cases test_cases.json \
@@ -44,8 +95,8 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
 
-      - name: Notify Slack — approved & pushed
-        if: github.event.action == 'slack_approve'
+      - name: Ask about test run
+        if: github.event.action == 'slack_push_to_zephyr'
         run: |
           python3 scripts/post_to_slack.py \
             --mode ask-test-run \
@@ -57,21 +108,8 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-      # ── REJECT ───────────────────────────────────────────────────────────────
-      - name: Notify Slack — rejected
-        if: github.event.action == 'slack_reject'
-        run: |
-          python3 scripts/post_to_slack.py \
-            --mode rejected \
-            --jira-task "${{ github.event.client_payload.jira_task_id }}" \
-            --message-ts "${{ github.event.client_payload.message_ts }}" \
-            --repo "${{ github.repository }}"
-        env:
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-
-      # ── ADD TEST CASE ─────────────────────────────────────────────────────────
-      - name: Append manual test case and re-post
+      # ── ADD TEST CASE ────────────────────────────────────────────────────
+      - name: Append manual test case
         if: github.event.action == 'slack_add_test_case'
         run: |
           python3 scripts/add_test_case.py \
@@ -81,6 +119,7 @@ jobs:
             --expected "${{ github.event.client_payload.expected }}" \
             --output test_cases.json
           python3 scripts/post_to_slack.py \
+            --mode review \
             --test-cases test_cases.json \
             --jira-task "${{ github.event.client_payload.jira_task_id }}" \
             --run-id "${{ github.event.client_payload.run_id }}" \
@@ -90,7 +129,7 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-      - name: Re-upload updated artifact
+      - name: Re-upload after adding test case
         if: github.event.action == 'slack_add_test_case'
         uses: actions/upload-artifact@v4
         with:
@@ -99,7 +138,7 @@ jobs:
           overwrite: true
           retention-days: 7
 
-      # ── CREATE TEST RUN ───────────────────────────────────────────────────────
+      # ── CREATE TEST RUN ──────────────────────────────────────────────────
       - name: Create test run in Zephyr
         if: github.event.action == 'slack_create_test_run'
         run: |
@@ -112,7 +151,7 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
 
-      - name: Notify Slack — test run created
+      - name: Notify — test run created
         if: github.event.action == 'slack_create_test_run'
         run: |
           python3 scripts/post_to_slack.py \
@@ -124,7 +163,8 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-      - name: Notify Slack — test run skipped
+      # ── SKIP TEST RUN ────────────────────────────────────────────────────
+      - name: Notify — test run skipped
         if: github.event.action == 'slack_skip_test_run'
         run: |
           python3 scripts/post_to_slack.py \
