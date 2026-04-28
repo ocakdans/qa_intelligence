@@ -1,5 +1,5 @@
 """
-Calls OpenAI API to generate structured test cases from Jira task requirements.
+Calls Anthropic Claude API to generate structured test cases from Jira task requirements.
 Outputs a JSON file consumed by subsequent workflow steps.
 """
 
@@ -7,7 +7,7 @@ import argparse
 import json
 import os
 import sys
-from openai import OpenAI
+import anthropic
 
 SYSTEM_PROMPT = """You are a senior QA engineer. Given a Jira task ID and its requirements,
 generate comprehensive test cases covering happy paths, edge cases, and negative scenarios.
@@ -32,25 +32,24 @@ Return ONLY valid JSON — no markdown fences, no extra text — in this exact s
 
 
 def generate(jira_task_id: str, requirements: str) -> dict:
-    client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
-    response = client.chat.completions.create(
-        model="gpt-4o",
+    message = client.messages.create(
+        model="claude-opus-4-5",
         max_tokens=4096,
+        system=SYSTEM_PROMPT,
         messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": (
                     f"Jira Task: {jira_task_id}\n\n"
                     f"Requirements:\n{requirements}"
                 ),
-            },
+            }
         ],
-        response_format={"type": "json_object"},
     )
 
-    raw = response.choices[0].message.content.strip()
+    raw = message.content[0].text.strip()
     return json.loads(raw)
 
 
