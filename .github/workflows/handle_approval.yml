@@ -91,9 +91,7 @@ jobs:
             --test-cases test_cases.json \
             --jira-task "${{ github.event.client_payload.jira_task_id }}"
         env:
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          ZEPHYR_API_TOKEN: ${{ secrets.ZEPHYR_API_TOKEN }}
 
       - name: Ask about test run
         if: github.event.action == 'slack_push_to_zephyr'
@@ -147,9 +145,7 @@ jobs:
             --jira-task "${{ github.event.client_payload.jira_task_id }}" \
             --test-cases test_cases.json
         env:
-          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
-          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          ZEPHYR_API_TOKEN: ${{ secrets.ZEPHYR_API_TOKEN }}
 
       - name: Notify — test run created
         if: github.event.action == 'slack_create_test_run'
