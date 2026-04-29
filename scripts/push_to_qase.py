@@ -23,16 +23,33 @@ def get_headers() -> dict:
     }
 
 
-def push_test_cases(project_code: str, test_cases: list, approved_ids: list) -> list:
-    """Create approved test cases in Qase and return their IDs."""
+def get_or_create_suite(project_code: str, suite_title: str) -> int:
+    """Create a test suite named after the Jira task ID and return its ID."""
+    headers = get_headers()
+    payload = {"title": suite_title}
+    resp = requests.post(f"{BASE_URL}/suite/{project_code}", json=payload, headers=headers)
+    resp.raise_for_status()
+    suite_id = resp.json().get("result", {}).get("id")
+    print(f"Created suite '{suite_title}' → id={suite_id}")
+    return suite_id
+
+
+def push_test_cases(project_code: str, test_cases: list, approved_ids: list,
+                    jira_task_id: str) -> list:
+    """Create only approved test cases in Qase inside a suite named after the Jira task."""
     headers = get_headers()
     created_ids = []
 
-    to_push = [tc for tc in test_cases if tc["id"] in approved_ids] if approved_ids else test_cases
+    # Fix: always filter strictly by approved_ids — never push rejected ones
+    approved_set = set(approved_ids)
+    to_push = [tc for tc in test_cases if tc["id"] in approved_set]
 
     if not to_push:
-        print("No approved test cases to push.", file=sys.stderr)
+        print("No approved test cases to push. Approve at least one in Slack first.", file=sys.stderr)
         sys.exit(1)
+
+    # Create a suite named after the Jira task ID
+    suite_id = get_or_create_suite(project_code, jira_task_id)
 
     for tc in to_push:
         steps = [
@@ -48,6 +65,7 @@ def push_test_cases(project_code: str, test_cases: list, approved_ids: list) -> 
             "title": tc["title"],
             "preconditions": tc.get("preconditions", ""),
             "steps": steps,
+            "suite_id": suite_id,
             "type": 1,       # other
             "priority": 2,   # medium
             "severity": 3,   # normal
@@ -108,7 +126,7 @@ def main():
 
     if args.mode == "push":
         print(f"Pushing approved test cases to Qase for {args.jira_task}...")
-        ids = push_test_cases(project_code, test_cases, approved_ids)
+        ids = push_test_cases(project_code, test_cases, approved_ids, args.jira_task)
 
         data["qase_ids"] = ids
         with open(args.test_cases, "w") as f:

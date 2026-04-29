@@ -196,15 +196,28 @@ def simple_update(client: WebClient, channel: str, message_ts: str, text: str):
     print(f"Posted update: {text}")
 
 
+def notify_tc_action(client: WebClient, channel: str, message_ts: str,
+                     action: str, tc_id: int, tc_title: str):
+    """Post a brief thread reply confirming approve/reject of a single TC."""
+    if action == "approve":
+        text = f"✅ *TC-{tc_id}: {tc_title}* — Approved"
+    else:
+        text = f"❌ *TC-{tc_id}: {tc_title}* — Rejected"
+    client.chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
+    print(text)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="review",
-                        choices=["review", "ask-test-run", "test-run-created", "test-run-skipped"])
+                        choices=["review", "ask-test-run", "test-run-created",
+                                 "test-run-skipped", "tc-approved", "tc-rejected"])
     parser.add_argument("--test-cases", help="Path to test_cases.json")
     parser.add_argument("--jira-task", required=True)
     parser.add_argument("--run-id", help="GitHub Actions run ID")
     parser.add_argument("--message-ts", help="Slack message timestamp")
     parser.add_argument("--repo", help="GitHub repo (owner/name)")
+    parser.add_argument("--tc-id", type=int, help="Test case ID for tc-approved/tc-rejected modes")
     args = parser.parse_args()
 
     client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
@@ -214,16 +227,30 @@ def main():
         post_test_cases(client, channel, args.test_cases, args.jira_task,
                         args.run_id, args.repo, args.message_ts)
 
+    elif args.mode in ("tc-approved", "tc-rejected"):
+        # Look up the TC title from the artifact
+        tc_title = f"Test Case {args.tc_id}"
+        if args.test_cases:
+            import json as _json
+            with open(args.test_cases) as f:
+                data = _json.load(f)
+            for tc in data.get("test_cases", []):
+                if tc["id"] == args.tc_id:
+                    tc_title = tc["title"]
+                    break
+        action = "approve" if args.mode == "tc-approved" else "reject"
+        notify_tc_action(client, channel, args.message_ts, action, args.tc_id, tc_title)
+
     elif args.mode == "ask-test-run":
         ask_test_run(client, channel, args.jira_task, args.run_id, args.message_ts, args.repo)
 
     elif args.mode == "test-run-created":
         simple_update(client, channel, args.message_ts,
-                      f"🚀 Test run created in Zephyr for *{args.jira_task}*. Time to test!")
+                      f"🚀 Test run created in Qase for *{args.jira_task}*. Time to test!")
 
     elif args.mode == "test-run-skipped":
         simple_update(client, channel, args.message_ts,
-                      f"⏭️ Test run skipped for *{args.jira_task}*. You can create it manually in Zephyr.")
+                      f"⏭️ Test run skipped for *{args.jira_task}*. You can create it manually in Qase.")
 
 
 if __name__ == "__main__":
