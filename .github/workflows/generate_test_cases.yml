@@ -14,6 +14,11 @@ on:
   repository_dispatch:
     types: [jira_task_to_qa]
 
+# Opt every JS-based action into Node 24 ahead of the June 2026 forced cutover.
+# https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   generate:
     runs-on: ubuntu-latest
