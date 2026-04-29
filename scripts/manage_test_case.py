@@ -13,12 +13,20 @@ def main():
     parser.add_argument("--action", required=True, choices=["approve", "reject"])
     parser.add_argument("--tc-id", required=True, type=int)
     parser.add_argument("--output", required=True)
+    parser.add_argument("--existing-approved-ids",
+                        help="JSON array of previously approved IDs carried in the Slack button payload")
     args = parser.parse_args()
 
     with open(args.test_cases) as f:
         data = json.load(f)
 
-    approved_ids = set(data.get("approved_ids", []))
+    # Prefer IDs from the Slack button payload (accumulates across runs) over the artifact
+    if args.existing_approved_ids:
+        approved_ids = set(json.loads(args.existing_approved_ids))
+        print(f"Seeding approved_ids from Slack payload: {approved_ids}")
+    else:
+        approved_ids = set(data.get("approved_ids", []))
+
     rejected_ids = set(data.get("rejected_ids", []))
 
     if args.action == "approve":

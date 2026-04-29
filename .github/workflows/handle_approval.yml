@@ -47,6 +47,7 @@ jobs:
             --test-cases test_cases.json \
             --action approve \
             --tc-id "${{ github.event.client_payload.tc_id }}" \
+            --existing-approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
             --output test_cases.json
 
       # ── REJECT INDIVIDUAL TEST CASE ──────────────────────────────────────
@@ -57,6 +58,7 @@ jobs:
             --test-cases test_cases.json \
             --action reject \
             --tc-id "${{ github.event.client_payload.tc_id }}" \
+            --existing-approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
             --output test_cases.json
 
       # ── RE-UPLOAD + REFRESH SLACK (after approve or reject) ──────────────

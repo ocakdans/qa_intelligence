@@ -81,6 +81,8 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
                                 "jira_task_id": jira_task_id,
                                 "repo": repo,
                                 "tc_id": tc["id"],
+                                # Carry accumulated approved_ids so each click builds on previous
+                                "approved_ids": list(approved_ids),
                             }),
                         },
                         {
@@ -93,6 +95,7 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
                                 "jira_task_id": jira_task_id,
                                 "repo": repo,
                                 "tc_id": tc["id"],
+                                "approved_ids": list(approved_ids),
                             }),
                         },
                     ],
