@@ -114,6 +114,7 @@ def main():
     parser.add_argument("--mode", default="push", choices=["push", "create-test-run"])
     parser.add_argument("--test-cases", required=True)
     parser.add_argument("--jira-task", required=True)
+    parser.add_argument("--approved-ids", help="JSON array of approved TC IDs from Slack button payload")
     args = parser.parse_args()
 
     project_code = os.environ.get("QASE_PROJECT_CODE", args.jira_task.split("-")[0])
@@ -122,7 +123,15 @@ def main():
         data = json.load(f)
 
     test_cases = data["test_cases"]
-    approved_ids = data.get("approved_ids", [])
+
+    # Prefer approved_ids from the Slack button payload (reliable cross-run state)
+    # Fall back to artifact state only if not provided
+    if args.approved_ids:
+        approved_ids = json.loads(args.approved_ids)
+        print(f"Using approved_ids from Slack payload: {approved_ids}")
+    else:
+        approved_ids = data.get("approved_ids", [])
+        print(f"Using approved_ids from artifact: {approved_ids}")
 
     if args.mode == "push":
         print(f"Pushing approved test cases to Qase for {args.jira_task}...")

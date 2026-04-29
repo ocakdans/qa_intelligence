@@ -41,9 +41,8 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
 
     for tc in visible:
         is_approved = tc["id"] in approved_ids
-        type_emoji = {"positive": "✅", "negative": "❌", "edge_case": "⚠️"}.get(tc["type"], "•")
+        type_emoji = {"positive": "🟢", "negative": "🔴", "edge_case": "⚠️"}.get(tc["type"], "•")
         steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(tc["steps"]))
-        status_prefix = "✅ *APPROVED* — " if is_approved else ""
 
         blocks.append(
             {
@@ -51,7 +50,7 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
                 "text": {
                     "type": "mrkdwn",
                     "text": (
-                        f"{status_prefix}{type_emoji} *TC-{tc['id']}: {tc['title']}*\n"
+                        f"{type_emoji} *TC-{tc['id']}: {tc['title']}*\n"
                         f"*Preconditions:* {tc.get('preconditions', 'None')}\n"
                         f"*Steps:*\n{steps_text}\n"
                         f"*Expected:* {tc['expected_result']}"
@@ -60,8 +59,13 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
             }
         )
 
-        # Only show buttons for pending test cases
-        if not is_approved:
+        if is_approved:
+            # Replace buttons with a clear approved indicator
+            blocks.append({
+                "type": "context",
+                "elements": [{"type": "mrkdwn", "text": "✅ *Approved* — will be pushed to Qase"}],
+            })
+        else:
             blocks.append(
                 {
                     "type": "actions",
@@ -97,7 +101,7 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
 
         blocks.append({"type": "divider"})
 
-    # Bottom action bar
+    # Bottom action bar — embed approved_ids in the push button so they survive cross-run
     blocks.append(
         {
             "type": "actions",
@@ -105,13 +109,14 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
             "elements": [
                 {
                     "type": "button",
-                    "text": {"type": "plain_text", "text": "🚀 Push Approved to Zephyr"},
+                    "text": {"type": "plain_text", "text": "🚀 Push Approved to Qase"},
                     "style": "primary",
                     "action_id": "qa_push_to_zephyr",
                     "value": json.dumps({
                         "run_id": run_id,
                         "jira_task_id": jira_task_id,
                         "repo": repo,
+                        "approved_ids": list(approved_ids),  # carry state in the button
                     }),
                 },
                 {
