@@ -124,14 +124,20 @@ def main():
 
     test_cases = data["test_cases"]
 
-    # Prefer approved_ids from the Slack button payload (reliable cross-run state)
-    # Fall back to artifact state only if not provided
-    if args.approved_ids:
-        approved_ids = json.loads(args.approved_ids)
+    # Prefer approved_ids from the Slack button payload (reliable cross-run state).
+    # toJson(null) renders as the string "null" — guard for that.
+    approved_ids = None
+    if args.approved_ids and args.approved_ids.strip().lower() != "null":
+        try:
+            approved_ids = json.loads(args.approved_ids)
+        except json.JSONDecodeError:
+            approved_ids = None
+
+    if approved_ids:
         print(f"Using approved_ids from Slack payload: {approved_ids}")
     else:
         approved_ids = data.get("approved_ids", [])
-        print(f"Using approved_ids from artifact: {approved_ids}")
+        print(f"Using approved_ids from artifact fallback: {approved_ids}")
 
     if args.mode == "push":
         print(f"Pushing approved test cases to Qase for {args.jira_task}...")

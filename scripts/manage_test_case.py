@@ -20,9 +20,17 @@ def main():
     with open(args.test_cases) as f:
         data = json.load(f)
 
-    # Prefer IDs from the Slack button payload (accumulates across runs) over the artifact
-    if args.existing_approved_ids:
-        approved_ids = set(json.loads(args.existing_approved_ids))
+    # Prefer IDs from the Slack button payload (accumulates across runs) over the artifact.
+    # toJson(null) renders as the literal string "null" — guard for that.
+    payload_ids = None
+    if args.existing_approved_ids and args.existing_approved_ids.strip().lower() != "null":
+        try:
+            payload_ids = json.loads(args.existing_approved_ids)
+        except json.JSONDecodeError:
+            payload_ids = None
+
+    if payload_ids is not None:
+        approved_ids = set(payload_ids)
         print(f"Seeding approved_ids from Slack payload: {approved_ids}")
     else:
         approved_ids = set(data.get("approved_ids", []))
