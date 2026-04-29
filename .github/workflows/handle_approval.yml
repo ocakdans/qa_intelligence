@@ -5,7 +5,7 @@ on:
     types:
       - slack_approve_tc
       - slack_reject_tc
-      - slack_push_to_zephyr
+      - slack_push_to_qase
       - slack_add_test_case
       - slack_create_test_run
       - slack_skip_test_run
@@ -30,7 +30,7 @@ jobs:
         if: >
           github.event.action == 'slack_approve_tc' ||
           github.event.action == 'slack_reject_tc' ||
-          github.event.action == 'slack_push_to_zephyr' ||
+          github.event.action == 'slack_push_to_qase' ||
           github.event.action == 'slack_add_test_case' ||
           github.event.action == 'slack_create_test_run'
         uses: actions/download-artifact@v4
@@ -85,9 +85,9 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-      # ── PUSH APPROVED TO ZEPHYR ──────────────────────────────────────────
+      # ── PUSH APPROVED TO QASE ────────────────────────────────────────────
       - name: Push approved test cases to Qase
-        if: github.event.action == 'slack_push_to_zephyr'
+        if: github.event.action == 'slack_push_to_qase'
         run: |
           python3 scripts/push_to_qase.py \
             --test-cases test_cases.json \
@@ -98,7 +98,7 @@ jobs:
           QASE_PROJECT_CODE: ${{ secrets.QASE_PROJECT_CODE }}
 
       - name: Ask about test run
-        if: github.event.action == 'slack_push_to_zephyr'
+        if: github.event.action == 'slack_push_to_qase'
         run: |
           python3 scripts/post_to_slack.py \
             --mode ask-test-run \

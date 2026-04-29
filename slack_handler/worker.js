@@ -13,7 +13,7 @@
 const ACTION_TO_DISPATCH = {
   qa_approve_tc: "slack_approve_tc",
   qa_reject_tc: "slack_reject_tc",
-  qa_push_to_zephyr: "slack_push_to_zephyr",
+  qa_push_to_qase: "slack_push_to_qase",
   qa_add_test_case: "slack_add_test_case",
   qa_create_test_run: "slack_create_test_run",
   qa_skip_test_run: "slack_skip_test_run",

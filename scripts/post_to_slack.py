@@ -1,7 +1,7 @@
 """
 Handles all Slack messaging for the QA pipeline:
   - Initial test cases review message (per-TC Approve / Reject buttons)
-  - Ask-test-run prompt (after push to Zephyr)
+  - Ask-test-run prompt (after push to Qase)
   - Status updates: rejected, test-run-created, test-run-skipped
 """
 
@@ -114,7 +114,7 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
                     "type": "button",
                     "text": {"type": "plain_text", "text": "🚀 Push Approved to Qase"},
                     "style": "primary",
-                    "action_id": "qa_push_to_zephyr",
+                    "action_id": "qa_push_to_qase",
                     "value": json.dumps({
                         "run_id": run_id,
                         "jira_task_id": jira_task_id,
@@ -167,7 +167,7 @@ def ask_test_run(client: WebClient, channel: str, jira_task_id: str,
             "text": {
                 "type": "mrkdwn",
                 "text": (
-                    f"✅ Approved test cases for *{jira_task_id}* pushed to Zephyr.\n"
+                    f"✅ Approved test cases for *{jira_task_id}* pushed to Qase.\n"
                     f"Would you like to create a *test run* now?"
                 ),
             },
