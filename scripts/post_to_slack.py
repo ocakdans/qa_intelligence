@@ -13,10 +13,34 @@ from slack_sdk import WebClient
 JIRA_BASE_URL = "https://selimocakdan.atlassian.net"
 
 
-def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str) -> list:
+def _parse_id_list(raw):
+    """Parse a JSON array of IDs from the workflow payload.
+
+    `toJson()` in GitHub Actions emits the literal string "null" when the
+    field is absent, so guard for that and for malformed JSON. Returns None
+    when no override was provided so the caller can fall back to the
+    artifact contents.
+    """
+    if raw is None or raw == "" or raw.strip().lower() == "null":
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    return set(parsed)
+
+
+def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str,
+                           approved_ids: set = None, rejected_ids: set = None) -> list:
     test_cases = data.get("test_cases", [])
-    approved_ids = set(data.get("approved_ids", []))
-    rejected_ids = set(data.get("rejected_ids", []))
+    # CLI/payload overrides win; the artifact JSON is just the fallback for
+    # backwards compatibility.
+    if approved_ids is None:
+        approved_ids = set(data.get("approved_ids", []))
+    if rejected_ids is None:
+        rejected_ids = set(data.get("rejected_ids", []))
 
     # Only show non-rejected test cases
     visible = [tc for tc in test_cases if tc["id"] not in rejected_ids]
@@ -140,11 +164,13 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
 
 
 def post_test_cases(client: WebClient, channel: str, test_cases_path: str,
-                    jira_task_id: str, run_id: str, repo: str, message_ts: str = None):
+                    jira_task_id: str, run_id: str, repo: str, message_ts: str = None,
+                    approved_ids: set = None, rejected_ids: set = None):
     with open(test_cases_path) as f:
         data = json.load(f)
 
-    blocks = build_test_case_blocks(data, jira_task_id, run_id, repo)
+    blocks = build_test_case_blocks(data, jira_task_id, run_id, repo,
+                                    approved_ids=approved_ids, rejected_ids=rejected_ids)
 
     if message_ts:
         client.chat_update(
@@ -226,14 +252,22 @@ def main():
     parser.add_argument("--message-ts", help="Slack message timestamp")
     parser.add_argument("--repo", help="GitHub repo (owner/name)")
     parser.add_argument("--tc-id", type=int, help="Test case ID for tc-approved/tc-rejected modes")
+    parser.add_argument("--approved-ids",
+                        help="JSON array of approved IDs (overrides the artifact). Source of truth in KV.")
+    parser.add_argument("--rejected-ids",
+                        help="JSON array of rejected IDs (overrides the artifact). Source of truth in KV.")
     args = parser.parse_args()
 
     client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
     channel = os.environ["SLACK_CHANNEL_ID"]
 
+    approved_override = _parse_id_list(args.approved_ids)
+    rejected_override = _parse_id_list(args.rejected_ids)
+
     if args.mode == "review":
         post_test_cases(client, channel, args.test_cases, args.jira_task,
-                        args.run_id, args.repo, args.message_ts)
+                        args.run_id, args.repo, args.message_ts,
+                        approved_ids=approved_override, rejected_ids=rejected_override)
 
     elif args.mode in ("tc-approved", "tc-rejected"):
         # Look up the TC title from the artifact

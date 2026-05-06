@@ -15,6 +15,14 @@ on:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
+# Serialize handlers per-message so two clicks don't try to chat_update at the
+# exact same instant. State itself lives in Cloudflare KV (owned by the worker)
+# so we don't strictly need this for correctness, but it keeps Slack repaints
+# clean.
+concurrency:
+  group: handle-${{ github.event.client_payload.run_id }}
+  cancel-in-progress: false
+
 jobs:
   handle:
     runs-on: ubuntu-latest
@@ -30,7 +38,7 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # ── DOWNLOAD ARTIFACT (needed for most actions) ───────────────────────
+      # ── DOWNLOAD ARTIFACT (test case CONTENT only — state lives in KV) ───
       - name: Download test cases artifact
         if: >
           github.event.action == 'slack_approve_tc' ||
@@ -44,38 +52,9 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ github.event.client_payload.run_id }}
 
-      # ── APPROVE INDIVIDUAL TEST CASE ─────────────────────────────────────
-      - name: Mark test case as approved
-        if: github.event.action == 'slack_approve_tc'
-        run: |
-          python3 scripts/manage_test_case.py \
-            --test-cases test_cases.json \
-            --action approve \
-            --tc-id "${{ github.event.client_payload.tc_id }}" \
-            --existing-approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
-            --output test_cases.json
-
-      # ── REJECT INDIVIDUAL TEST CASE ──────────────────────────────────────
-      - name: Mark test case as rejected
-        if: github.event.action == 'slack_reject_tc'
-        run: |
-          python3 scripts/manage_test_case.py \
-            --test-cases test_cases.json \
-            --action reject \
-            --tc-id "${{ github.event.client_payload.tc_id }}" \
-            --existing-approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
-            --output test_cases.json
-
-      # ── RE-UPLOAD + REFRESH SLACK (after approve or reject) ──────────────
-      - name: Re-upload artifact after TC change
-        if: github.event.action == 'slack_approve_tc' || github.event.action == 'slack_reject_tc'
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-cases-${{ github.event.client_payload.run_id }}
-          path: test_cases.json
-          overwrite: true
-          retention-days: 7
-
+      # ── REFRESH SLACK MESSAGE (after approve or reject) ──────────────────
+      # The worker has already persisted the new state in KV and threaded it
+      # into client_payload. We just re-render the message from that state.
       - name: Refresh Slack message after TC change
         if: github.event.action == 'slack_approve_tc' || github.event.action == 'slack_reject_tc'
         run: |
@@ -85,7 +64,9 @@ jobs:
             --jira-task "${{ github.event.client_payload.jira_task_id }}" \
             --run-id "${{ github.event.client_payload.run_id }}" \
             --message-ts "${{ github.event.client_payload.message_ts }}" \
-            --repo "${{ github.repository }}"
+            --repo "${{ github.repository }}" \
+            --approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
+            --rejected-ids '${{ toJson(github.event.client_payload.rejected_ids) }}'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -131,7 +112,9 @@ jobs:
             --jira-task "${{ github.event.client_payload.jira_task_id }}" \
             --run-id "${{ github.event.client_payload.run_id }}" \
             --message-ts "${{ github.event.client_payload.message_ts }}" \
-            --repo "${{ github.repository }}"
+            --repo "${{ github.repository }}" \
+            --approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
+            --rejected-ids '${{ toJson(github.event.client_payload.rejected_ids) }}'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
