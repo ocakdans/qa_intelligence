@@ -186,10 +186,36 @@ def build_report(project_code: str, jira_task_id: str, run: dict,
 # ── Jira write ────────────────────────────────────────────────────────────
 
 def post_jira_comment(jira_base_url: str, issue_key: str, body_text: str):
-    url = f"{jira_base_url.rstrip('/')}/rest/api/2/issue/{issue_key}/comment"
+    base = jira_base_url.rstrip("/")
+
+    # Verify the issue exists / we can see it before trying to comment.
+    # Atlassian Cloud often returns 404 for both "missing" and "no access",
+    # so this gives us a cleaner failure mode than a comment 404.
+    probe_url = f"{base}/rest/api/2/issue/{issue_key}?fields=summary"
+    probe = requests.get(probe_url, headers=jira_headers())
+    if probe.status_code == 401:
+        print("Jira auth failed (401). Check JIRA_EMAIL and JIRA_API_TOKEN.",
+              file=sys.stderr)
+        probe.raise_for_status()
+    if probe.status_code == 404:
+        print(
+            f"Jira issue {issue_key} not found at {base}. Confirm:\n"
+            f"  - JIRA_BASE_URL is correct (no trailing path, includes https://)\n"
+            f"  - The issue exists and the JIRA_EMAIL user has Browse Project permission\n"
+            f"  - The project key in '{issue_key}' matches a real Jira project",
+            file=sys.stderr,
+        )
+        probe.raise_for_status()
+    probe.raise_for_status()
+
+    url = f"{base}/rest/api/2/issue/{issue_key}/comment"
     resp = requests.post(url, json={"body": body_text}, headers=jira_headers())
     if resp.status_code not in (200, 201):
-        print(f"Jira comment failed: {resp.status_code} {resp.text}", file=sys.stderr)
+        # Strip the body text so the print doesn't trigger secret-masking on
+        # the URL, which would obscure the diagnostic.
+        print(f"Jira comment POST failed: HTTP {resp.status_code}",
+              file=sys.stderr)
+        print(f"Response body: {resp.text[:500]}", file=sys.stderr)
         resp.raise_for_status()
     return resp.json()
 
