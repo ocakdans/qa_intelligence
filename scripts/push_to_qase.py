@@ -23,17 +23,11 @@ def get_headers() -> dict:
     }
 
 
-def get_or_create_suite(project_code: str, suite_title: str) -> int:
-    """Return the ID of the suite named `suite_title`, creating it only if
-    no existing suite has that exact title. This keeps repeated generations
-    for the same Jira task appending to a single suite instead of spawning
-    duplicates each time.
-    """
+def find_suite_id(project_code: str, suite_title: str):
+    """Return the ID of an existing suite with this exact title, or None."""
     headers = get_headers()
-
-    # Search first. Qase's `filters[search]` is fuzzy/full-text, so we still
-    # match by exact title in code. Scan up to 1000 suites (10 pages of 100)
-    # before giving up and creating a new one.
+    # Qase's `filters[search]` is fuzzy/full-text, so we still match by
+    # exact title in code. Scan up to 1000 suites (10 pages of 100).
     for offset in range(0, 1000, 100):
         resp = requests.get(
             f"{BASE_URL}/suite/{project_code}",
@@ -45,19 +39,52 @@ def get_or_create_suite(project_code: str, suite_title: str) -> int:
         entities = result.get("entities", []) or []
         for suite in entities:
             if suite.get("title") == suite_title:
-                suite_id = suite.get("id")
-                print(f"Reusing existing suite '{suite_title}' → id={suite_id}")
-                return suite_id
+                return suite.get("id")
         if len(entities) < 100:
-            break  # last page
+            break
+    return None
 
-    # Not found — create it.
+
+def get_or_create_suite(project_code: str, suite_title: str) -> int:
+    """Return the ID of the suite named `suite_title`, creating it only if
+    no existing suite has that exact title. This keeps repeated generations
+    for the same Jira task appending to a single suite instead of spawning
+    duplicates each time.
+    """
+    existing = find_suite_id(project_code, suite_title)
+    if existing is not None:
+        print(f"Reusing existing suite '{suite_title}' → id={existing}")
+        return existing
+
+    headers = get_headers()
     payload = {"title": suite_title}
     resp = requests.post(f"{BASE_URL}/suite/{project_code}", json=payload, headers=headers)
     resp.raise_for_status()
     suite_id = resp.json().get("result", {}).get("id")
     print(f"Created new suite '{suite_title}' → id={suite_id}")
     return suite_id
+
+
+def list_cases_in_suite(project_code: str, suite_id: int) -> list:
+    """Return all case IDs that currently live in the given suite."""
+    headers = get_headers()
+    case_ids = []
+    for offset in range(0, 1000, 100):
+        resp = requests.get(
+            f"{BASE_URL}/case/{project_code}",
+            params={"limit": 100, "offset": offset, "filters[suite_id]": suite_id},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result", {}) or {}
+        entities = result.get("entities", []) or []
+        for case in entities:
+            cid = case.get("id")
+            if cid is not None:
+                case_ids.append(cid)
+        if len(entities) < 100:
+            break
+    return case_ids
 
 
 def push_test_cases(project_code: str, test_cases: list, approved_ids: list,
@@ -145,27 +172,26 @@ def main():
 
     project_code = os.environ.get("QASE_PROJECT_CODE", args.jira_task.split("-")[0])
 
-    with open(args.test_cases) as f:
-        data = json.load(f)
-
-    test_cases = data["test_cases"]
-
-    # Prefer approved_ids from the Slack button payload (reliable cross-run state).
-    # toJson(null) renders as the string "null" — guard for that.
-    approved_ids = None
-    if args.approved_ids and args.approved_ids.strip().lower() != "null":
-        try:
-            approved_ids = json.loads(args.approved_ids)
-        except json.JSONDecodeError:
-            approved_ids = None
-
-    if approved_ids:
-        print(f"Using approved_ids from Slack payload: {approved_ids}")
-    else:
-        approved_ids = data.get("approved_ids", [])
-        print(f"Using approved_ids from artifact fallback: {approved_ids}")
-
     if args.mode == "push":
+        with open(args.test_cases) as f:
+            data = json.load(f)
+        test_cases = data["test_cases"]
+
+        # Prefer approved_ids from the Slack button payload (reliable cross-run state).
+        # toJson(null) renders as the string "null" — guard for that.
+        approved_ids = None
+        if args.approved_ids and args.approved_ids.strip().lower() != "null":
+            try:
+                approved_ids = json.loads(args.approved_ids)
+            except json.JSONDecodeError:
+                approved_ids = None
+
+        if approved_ids:
+            print(f"Using approved_ids from Slack payload: {approved_ids}")
+        else:
+            approved_ids = data.get("approved_ids", [])
+            print(f"Using approved_ids from artifact fallback: {approved_ids}")
+
         print(f"Pushing approved test cases to Qase for {args.jira_task}...")
         ids = push_test_cases(project_code, test_cases, approved_ids, args.jira_task)
 
@@ -176,11 +202,23 @@ def main():
         print(f"\nDone. Created {len(ids)} test case(s): {ids}")
 
     elif args.mode == "create-test-run":
-        ids = data.get("qase_ids", [])
-        if not ids:
-            print("No Qase IDs found — run push first.", file=sys.stderr)
+        # Source of truth = Qase itself. The artifact-bound qase_ids never
+        # survive cross-run (artifacts get re-uploaded to the wrong run id),
+        # so we just ask Qase what's in the suite right now.
+        suite_id = find_suite_id(project_code, args.jira_task)
+        if suite_id is None:
+            print(f"No Qase suite named '{args.jira_task}'. Push approved test cases first.",
+                  file=sys.stderr)
             sys.exit(1)
-        create_test_run(project_code, args.jira_task, ids)
+
+        case_ids = list_cases_in_suite(project_code, suite_id)
+        if not case_ids:
+            print(f"Suite '{args.jira_task}' has no test cases. Push approved test cases first.",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        print(f"Found {len(case_ids)} case(s) in suite '{args.jira_task}': {case_ids}")
+        create_test_run(project_code, args.jira_task, case_ids)
 
 
 if __name__ == "__main__":
