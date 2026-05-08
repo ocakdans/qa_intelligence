@@ -188,25 +188,45 @@ def build_report(project_code: str, jira_task_id: str, run: dict,
 def post_jira_comment(jira_base_url: str, issue_key: str, body_text: str):
     base = jira_base_url.rstrip("/")
 
-    # Verify the issue exists / we can see it before trying to comment.
-    # Atlassian Cloud often returns 404 for both "missing" and "no access",
-    # so this gives us a cleaner failure mode than a comment 404.
+    # Step 1: who am I? /myself returns 200 only when basic-auth credentials
+    # are valid. This unambiguously distinguishes auth failures from issue
+    # / project visibility problems (Atlassian Cloud returns 404 for both
+    # "wrong creds" and "no permission to see issue").
+    me = requests.get(f"{base}/rest/api/2/myself", headers=jira_headers())
+    if me.status_code == 401 or me.status_code == 403:
+        print(
+            f"Jira auth failed: HTTP {me.status_code}. Check JIRA_EMAIL and "
+            f"JIRA_API_TOKEN — the email must match the API token owner.",
+            file=sys.stderr,
+        )
+        me.raise_for_status()
+    if me.status_code == 404:
+        # If even /myself is 404, the base URL itself is wrong.
+        print(
+            "Jira /myself returned 404. JIRA_BASE_URL is almost certainly "
+            "wrong. It should be like 'https://your-tenant.atlassian.net' "
+            "(no trailing slash, no /jira, no /wiki).",
+            file=sys.stderr,
+        )
+        me.raise_for_status()
+    me.raise_for_status()
+    me_data = me.json()
+    print(f"Jira auth OK as: {me_data.get('displayName')} ({me_data.get('emailAddress', 'email hidden')})")
+
+    # Step 2: can we see this specific issue?
     probe_url = f"{base}/rest/api/2/issue/{issue_key}?fields=summary"
     probe = requests.get(probe_url, headers=jira_headers())
-    if probe.status_code == 401:
-        print("Jira auth failed (401). Check JIRA_EMAIL and JIRA_API_TOKEN.",
-              file=sys.stderr)
-        probe.raise_for_status()
     if probe.status_code == 404:
         print(
-            f"Jira issue {issue_key} not found at {base}. Confirm:\n"
-            f"  - JIRA_BASE_URL is correct (no trailing path, includes https://)\n"
-            f"  - The issue exists and the JIRA_EMAIL user has Browse Project permission\n"
-            f"  - The project key in '{issue_key}' matches a real Jira project",
+            f"Jira issue '{issue_key}' not visible to JIRA_EMAIL. Either:\n"
+            f"  - The issue doesn't exist (try opening "
+            f"{base}/browse/{issue_key} in a browser)\n"
+            f"  - The user doesn't have Browse Project permission on its project",
             file=sys.stderr,
         )
         probe.raise_for_status()
     probe.raise_for_status()
+    print(f"Jira issue {issue_key} visible — '{probe.json().get('fields', {}).get('summary', '')}'")
 
     url = f"{base}/rest/api/2/issue/{issue_key}/comment"
     resp = requests.post(url, json={"body": body_text}, headers=jira_headers())
