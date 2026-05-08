@@ -230,6 +230,42 @@ def simple_update(client: WebClient, channel: str, message_ts: str, text: str):
     print(f"Posted update: {text}")
 
 
+def notify_test_run_created(client: WebClient, channel: str, message_ts: str,
+                            jira_task_id: str, run_id: str, repo: str):
+    """Confirm a Qase run was created and offer to post a report back to Jira."""
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": f"🚀 Test run created in Qase for *{jira_task_id}*. Time to test!",
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"qa_jira_report_{run_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📊 Post Report to Jira"},
+                    "style": "primary",
+                    "action_id": "qa_post_jira_report",
+                    "value": json.dumps({
+                        "run_id": run_id,
+                        "jira_task_id": jira_task_id,
+                        "repo": repo,
+                    }),
+                }
+            ],
+        },
+    ]
+    client.chat_postMessage(
+        channel=channel, thread_ts=message_ts, blocks=blocks,
+        text=f"Test run created for {jira_task_id}",
+    )
+    print("Posted test-run-created notification with Jira report button.")
+
+
 def notify_tc_action(client: WebClient, channel: str, message_ts: str,
                      action: str, tc_id: int, tc_title: str):
     """Post a brief thread reply confirming approve/reject of a single TC."""
@@ -245,7 +281,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", default="review",
                         choices=["review", "ask-test-run", "test-run-created",
-                                 "test-run-skipped", "tc-approved", "tc-rejected"])
+                                 "test-run-skipped", "tc-approved", "tc-rejected",
+                                 "jira-report-posted"])
     parser.add_argument("--test-cases", help="Path to test_cases.json")
     parser.add_argument("--jira-task", required=True)
     parser.add_argument("--run-id", help="GitHub Actions run ID")
@@ -287,12 +324,17 @@ def main():
         ask_test_run(client, channel, args.jira_task, args.run_id, args.message_ts, args.repo)
 
     elif args.mode == "test-run-created":
-        simple_update(client, channel, args.message_ts,
-                      f"🚀 Test run created in Qase for *{args.jira_task}*. Time to test!")
+        notify_test_run_created(client, channel, args.message_ts,
+                                args.jira_task, args.run_id, args.repo)
 
     elif args.mode == "test-run-skipped":
         simple_update(client, channel, args.message_ts,
                       f"⏭️ Test run skipped for *{args.jira_task}*. You can create it manually in Qase.")
+
+    elif args.mode == "jira-report-posted":
+        jira_url = f"{JIRA_BASE_URL}/browse/{args.jira_task}"
+        simple_update(client, channel, args.message_ts,
+                      f"📊 Test report posted on <{jira_url}|{args.jira_task}>.")
 
 
 if __name__ == "__main__":
