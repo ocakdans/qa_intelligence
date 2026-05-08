@@ -217,11 +217,25 @@ def post_jira_comment(jira_base_url: str, issue_key: str, body_text: str):
     probe_url = f"{base}/rest/api/2/issue/{issue_key}?fields=summary"
     probe = requests.get(probe_url, headers=jira_headers())
     if probe.status_code == 404:
+        # Help the user figure out what project keys actually exist.
+        try:
+            projects_resp = requests.get(
+                f"{base}/rest/api/2/project",
+                headers=jira_headers(),
+            )
+            if projects_resp.ok:
+                projects = projects_resp.json() or []
+                listed = ", ".join(
+                    f"{p.get('key')} ({p.get('name')})" for p in projects[:20]
+                ) or "(none)"
+                print(f"Jira projects visible to {me_data.get('emailAddress', 'you')}: {listed}",
+                      file=sys.stderr)
+        except Exception:
+            pass
         print(
-            f"Jira issue '{issue_key}' not visible to JIRA_EMAIL. Either:\n"
-            f"  - The issue doesn't exist (try opening "
-            f"{base}/browse/{issue_key} in a browser)\n"
-            f"  - The user doesn't have Browse Project permission on its project",
+            f"Jira issue '{issue_key}' not found / not visible. Either:\n"
+            f"  - The project key in '{issue_key}' is wrong (see the list above)\n"
+            f"  - That specific issue number doesn't exist yet",
             file=sys.stderr,
         )
         probe.raise_for_status()
