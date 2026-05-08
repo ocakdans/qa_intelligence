@@ -24,13 +24,39 @@ def get_headers() -> dict:
 
 
 def get_or_create_suite(project_code: str, suite_title: str) -> int:
-    """Create a test suite named after the Jira task ID and return its ID."""
+    """Return the ID of the suite named `suite_title`, creating it only if
+    no existing suite has that exact title. This keeps repeated generations
+    for the same Jira task appending to a single suite instead of spawning
+    duplicates each time.
+    """
     headers = get_headers()
+
+    # Search first. Qase's `filters[search]` is fuzzy/full-text, so we still
+    # match by exact title in code. Scan up to 1000 suites (10 pages of 100)
+    # before giving up and creating a new one.
+    for offset in range(0, 1000, 100):
+        resp = requests.get(
+            f"{BASE_URL}/suite/{project_code}",
+            params={"limit": 100, "offset": offset, "filters[search]": suite_title},
+            headers=headers,
+        )
+        resp.raise_for_status()
+        result = resp.json().get("result", {}) or {}
+        entities = result.get("entities", []) or []
+        for suite in entities:
+            if suite.get("title") == suite_title:
+                suite_id = suite.get("id")
+                print(f"Reusing existing suite '{suite_title}' → id={suite_id}")
+                return suite_id
+        if len(entities) < 100:
+            break  # last page
+
+    # Not found — create it.
     payload = {"title": suite_title}
     resp = requests.post(f"{BASE_URL}/suite/{project_code}", json=payload, headers=headers)
     resp.raise_for_status()
     suite_id = resp.json().get("result", {}).get("id")
-    print(f"Created suite '{suite_title}' → id={suite_id}")
+    print(f"Created new suite '{suite_title}' → id={suite_id}")
     return suite_id
 
 
