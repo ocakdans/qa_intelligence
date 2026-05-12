@@ -145,8 +145,22 @@ def find_latest_run(project_code, jira_task_id):
     return candidates[0]
 
 
+def _result_recency_key(r):
+    """Bigger = more recent. Works for both ISO strings and unix ints."""
+    for k in ("end_time", "updated_at", "created_at"):
+        v = r.get(k)
+        if v is not None:
+            return str(v)
+    return ""
+
+
 def get_run_results(project_code, run_id):
-    """Per-case latest result, keyed by case_id."""
+    """Per-case LATEST result, keyed by case_id.
+
+    A case can be re-executed many times within a single Qase run; the API
+    returns every execution as its own row. We must pick the most-recent
+    one per case_id, otherwise re-runs are invisible to the report.
+    """
     raw = []
     for offset in range(0, 1000, 100):
         resp = requests.get(
@@ -159,12 +173,26 @@ def get_run_results(project_code, run_id):
         raw.extend(entities)
         if len(entities) < 100:
             break
+
     by_case = {}
     for r in raw:
         cid = r.get("case_id")
-        if cid is None or cid in by_case:
+        if cid is None:
             continue
-        by_case[cid] = r
+        prev = by_case.get(cid)
+        if prev is None or _result_recency_key(r) > _result_recency_key(prev):
+            by_case[cid] = r
+
+    # Loud logging so a stale-data complaint is easy to debug from the
+    # workflow log — you can see exactly which result hash we picked per
+    # case and when it was executed.
+    print(f"Fetched {len(raw)} raw result row(s); kept latest per case → "
+          f"{len(by_case)} case(s).")
+    for cid in sorted(by_case.keys()):
+        r = by_case[cid]
+        print(f"  case #{cid}: status={r.get('status')!r} "
+              f"end_time={r.get('end_time')} "
+              f"hash={(r.get('hash') or '')[:10]}")
     return by_case
 
 
@@ -589,7 +617,9 @@ def main():
         print(f"No Qase test run found for '{args.jira_task}'. Create one first.",
               file=sys.stderr)
         sys.exit(1)
-    print(f"Latest Qase run: #{run['id']} — {run.get('title')}")
+    print(f"Latest Qase run picked: #{run['id']} — {run.get('title')!r} "
+          f"(status={run.get('status_text') or run.get('status')}, "
+          f"created_at={run.get('start_time') or run.get('created_at')})")
 
     results = get_run_results(project_code, run["id"])
 
