@@ -319,23 +319,22 @@ def slack_client():
     return WebClient(token=os.environ["SLACK_BOT_TOKEN"])
 
 
-def post_failure_action_prompt(channel, message_ts, jira_task_id, run_id, repo,
-                               passed, failed, qase_run_url):
-    """Two-button choice: create bug tickets or post a single comment."""
+def post_report_confirmation(channel, message_ts, jira_task_id, jira_base_url,
+                             run_id, repo, passed, failed, qase_run_url,
+                             offer_bug_tickets: bool):
+    """Confirm a fresh comment was just posted; optionally surface the
+    Create-Bug-Tickets action as a follow-up. Re-clickable forever."""
+    jira_url = f"{jira_base_url.rstrip('/')}/browse/{jira_task_id}"
+    summary = (
+        f"📊 Test report posted on <{jira_url}|{jira_task_id}>.\n"
+        f"✅ Passed: *{passed}*  ·  ❌ Failed: *{failed}*  ·  "
+        f"<{qase_run_url}|View run in Qase>"
+    )
     blocks = [
-        {
-            "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"🎉 *All test cases executed for {jira_task_id}.*\n"
-                    f"✅ Passed: *{passed}*  ·  ❌ Failed: *{failed}*\n"
-                    f"<{qase_run_url}|View run in Qase>\n\n"
-                    f"How should I handle the *{failed} failed* case(s)?"
-                ),
-            },
-        },
-        {
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
+    ]
+    if offer_bug_tickets and failed > 0:
+        blocks.append({
             "type": "actions",
             "block_id": f"qa_failure_action_{run_id}",
             "elements": [
@@ -350,22 +349,11 @@ def post_failure_action_prompt(channel, message_ts, jira_task_id, run_id, repo,
                         "repo": repo,
                     }),
                 },
-                {
-                    "type": "button",
-                    "text": {"type": "plain_text", "text": "📝 Post as Comment"},
-                    "action_id": "qa_post_comment_only",
-                    "value": json.dumps({
-                        "run_id": run_id,
-                        "jira_task_id": jira_task_id,
-                        "repo": repo,
-                    }),
-                },
             ],
-        },
-    ]
+        })
     slack_client().chat_postMessage(
         channel=channel, thread_ts=message_ts, blocks=blocks,
-        text=f"{failed} failed case(s) for {jira_task_id} — choose how to report",
+        text=f"Test report posted on {jira_task_id}",
     )
 
 
@@ -479,7 +467,13 @@ def build_bug_summary_comment(jira_task_id, qase_run_url, created):
 
 # ── Mode runners ──────────────────────────────────────────────────────────
 
-def run_comment_mode(args, ctx):
+def run_comment_mode(args, ctx, *, offer_bug_tickets: bool = True):
+    """Post a fresh Jira summary comment AND a Slack confirmation reply.
+
+    Re-clickable: every invocation creates a new Jira comment (Jira doesn't
+    dedupe). If `offer_bug_tickets` and there are failures, the Slack
+    confirmation also exposes a 🐞 Create Bug Tickets button as a follow-up.
+    """
     body = build_summary_comment(
         ctx["project_code"], args.jira_task, ctx["run"],
         ctx["results"], ctx["case_titles"],
@@ -491,9 +485,20 @@ def run_comment_mode(args, ctx):
     print(f"✅ Posted report comment on {args.jira_task}")
 
     if args.message_ts:
-        post_simple_thread_reply(
+        counts, _ = aggregate(ctx["results"], ctx["case_titles"].keys())
+        qase_run_url = (
+            f"https://app.qase.io/run/{ctx['project_code']}/"
+            f"dashboard/{ctx['run']['id']}"
+        )
+        post_report_confirmation(
             os.environ["SLACK_CHANNEL_ID"], args.message_ts,
-            f"📊 Test report posted on <{ctx['jira_base_url']}/browse/{args.jira_task}|{args.jira_task}>.",
+            args.jira_task, ctx["jira_base_url"],
+            args.run_id or "manual",
+            args.repo or os.environ.get("GITHUB_REPOSITORY", ""),
+            passed=counts.get("passed", 0),
+            failed=counts.get("failed", 0),
+            qase_run_url=qase_run_url,
+            offer_bug_tickets=offer_bug_tickets,
         )
 
 
@@ -558,30 +563,21 @@ def run_bug_tickets_mode(args, ctx):
 
 
 def run_router_mode(args, ctx):
+    """Each click of 'Post Report to Jira' is a fresh, independent run:
+    always post a new Jira comment with the *current* Qase state, and if
+    that state has failures, surface the bug-ticket follow-up in the same
+    Slack confirmation. No blocking prompt step."""
     counts, _ = aggregate(ctx["results"], ctx["case_titles"].keys())
     failed = counts.get("failed", 0)
     untested = counts.get("untested", 0) + counts.get("in_progress", 0)
-    qase_run_url = f"https://app.qase.io/run/{ctx['project_code']}/dashboard/{ctx['run']['id']}"
-
     print(f"Router decision input: failed={failed}, not-yet-executed={untested}, "
           f"all_counts={counts}")
 
-    # The user wants the prompt only when execution is 100% complete AND
-    # there are failures to make a decision about. Any other path falls
-    # straight through to the existing comment behavior.
-    if untested == 0 and failed > 0 and args.message_ts:
-        passed = counts.get("passed", 0)
-        post_failure_action_prompt(
-            os.environ["SLACK_CHANNEL_ID"], args.message_ts,
-            args.jira_task, args.run_id or "manual",
-            args.repo or os.environ.get("GITHUB_REPOSITORY", ""),
-            passed, failed, qase_run_url,
-        )
-        print(f"Posted failure-action prompt to Slack ({failed} failures).")
-        return
-
-    # Default: post the comment immediately.
-    run_comment_mode(args, ctx)
+    # offer_bug_tickets only when there are failures (no point asking otherwise).
+    # We don't gate on 100% executed anymore — even partial runs benefit from
+    # having the comment posted now, and the bug-ticket button is safe to
+    # show whenever failures exist.
+    run_comment_mode(args, ctx, offer_bug_tickets=(failed > 0))
 
 
 # ── Entry point ──────────────────────────────────────────────────────────
