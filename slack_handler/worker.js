@@ -39,6 +39,16 @@ export default {
       return new Response("Method Not Allowed", { status: 405 });
     }
 
+    const url = new URL(request.url);
+
+    // ── Jira automation webhook ────────────────────────────────────
+    // Fires when an issue transitions into the QA column. Auth is a
+    // shared secret in the X-Webhook-Secret header.
+    if (url.pathname === "/jira-webhook") {
+      return handleJiraWebhook(request, env);
+    }
+
+    // ── Slack interactivity (default) ──────────────────────────────
     const body = await request.text();
 
     if (!(await verifySlackSignature(request, body, env.SLACK_SIGNING_SECRET))) {
@@ -255,6 +265,57 @@ async function openAddTestCaseModal(triggerId, value, messageTs, channelId, stat
     },
     body: JSON.stringify({ trigger_id: triggerId, view: modal }),
   });
+}
+
+// ── Jira webhook handler ─────────────────────────────────────────────
+
+async function handleJiraWebhook(request, env) {
+  // Shared-secret auth. The same value must be set in the Jira automation
+  // rule's "Send web request" action under the X-Webhook-Secret header.
+  const supplied = request.headers.get("X-Webhook-Secret");
+  if (!env.JIRA_WEBHOOK_SECRET || !supplied || !constantTimeEquals(supplied, env.JIRA_WEBHOOK_SECRET)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return new Response("Bad Request: body must be JSON", { status: 400 });
+  }
+
+  // Accept either a flat shape (sent by Jira automation) or a nested issue
+  // shape (sent by Jira's built-in webhooks).
+  const issue = payload.issue || payload;
+  const key = issue.key || payload.key;
+  const summary = (issue.fields && issue.fields.summary) || issue.summary || payload.summary || "";
+  const description = (issue.fields && issue.fields.description) || issue.description || payload.description || "";
+
+  if (!key) {
+    return new Response("Bad Request: missing issue key", { status: 400 });
+  }
+
+  const requirements = [summary, description].filter(Boolean).join("\n\n").trim();
+  if (!requirements) {
+    return new Response("Bad Request: issue has no summary or description to use as requirements", { status: 400 });
+  }
+
+  await triggerGitHubDispatch("jira_task_to_qa", {
+    jira_task_id: key,
+    requirements,
+  }, env);
+
+  return new Response(JSON.stringify({ ok: true, key }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+function constantTimeEquals(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
 }
 
 async function verifySlackSignature(request, body, signingSecret) {
