@@ -27,6 +27,8 @@ const ACTION_TO_DISPATCH = {
   qa_create_test_run: "slack_create_test_run",
   qa_skip_test_run: "slack_skip_test_run",
   qa_post_jira_report: "slack_post_jira_report",
+  qa_create_bug_tickets: "slack_create_bug_tickets",
+  qa_post_comment_only: "slack_post_comment_only",
 };
 
 const STATE_ACTIONS = new Set(["qa_approve_tc", "qa_reject_tc"]);

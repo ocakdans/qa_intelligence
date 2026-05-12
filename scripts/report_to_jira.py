@@ -1,25 +1,44 @@
 """
-Posts a Qase test-run summary as a comment on the linked Jira issue.
+Three-way Jira reporter for a Qase test run.
 
-Flow for a given Jira task ID (e.g. QCT-1):
-  1. Find the Qase suite with that exact title.
-  2. Find the most recent test run whose title contains the task ID.
-  3. Read run results (per-case status) and case titles from Qase.
-  4. Format a wiki-markup comment and POST it to /rest/api/2/issue/{key}/comment.
+Modes
+-----
+* `auto-router` (default)
+    Read the latest Qase run for the Jira task. If every case has been
+    executed AND there are any failures, post a Slack prompt asking the
+    user how to handle them (bug tickets vs. plain comment). Otherwise
+    fall through to `comment`.
 
-Qase docs: https://developers.qase.io/reference
-Jira docs: https://developer.atlassian.com/cloud/jira/platform/rest/v2/
+* `comment`
+    Post a single wiki-markup summary as a comment on the Jira issue.
+    No bug tickets are created.
+
+* `bug-tickets`
+    Create one Jira "Bug" issue per failed case, with the test steps,
+    expected result, tester comment, and any Qase attachments copied
+    over. Then post a summary comment on the parent issue linking to
+    every bug created.
+
+Auth / config (env)
+    QASE_API_TOKEN
+    QASE_PROJECT_CODE        (defaults to the prefix of --jira-task)
+    JIRA_BASE_URL
+    JIRA_EMAIL
+    JIRA_API_TOKEN
+    SLACK_BOT_TOKEN
+    SLACK_CHANNEL_ID
 """
 
 import argparse
 import base64
+import json
 import os
 import sys
 import requests
+from slack_sdk import WebClient
 
 QASE_BASE = "https://api.qase.io/v1"
 
-# Display ordering in the report — passed first, untested last.
 STATUS_ORDER = [
     "passed", "failed", "blocked", "skipped",
     "retest", "invalid", "in_progress", "untested",
@@ -34,16 +53,24 @@ STATUS_EMOJI = {
     "in_progress": "🔵",
     "untested": "⚪",
 }
+EXECUTED_STATUSES = {"passed", "failed", "blocked", "skipped", "invalid"}
 
+
+# ── HTTP helpers ──────────────────────────────────────────────────────────
 
 def qase_headers():
     return {"Token": os.environ["QASE_API_TOKEN"], "Content-Type": "application/json"}
 
 
+def jira_basic_auth():
+    return base64.b64encode(
+        f"{os.environ['JIRA_EMAIL']}:{os.environ['JIRA_API_TOKEN']}".encode()
+    ).decode()
+
+
 def jira_headers():
-    creds = f"{os.environ['JIRA_EMAIL']}:{os.environ['JIRA_API_TOKEN']}".encode()
     return {
-        "Authorization": "Basic " + base64.b64encode(creds).decode(),
+        "Authorization": "Basic " + jira_basic_auth(),
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
@@ -51,8 +78,7 @@ def jira_headers():
 
 # ── Qase reads ────────────────────────────────────────────────────────────
 
-def find_suite_id(project_code: str, suite_title: str):
-    """Return the ID of an existing Qase suite with this exact title, or None."""
+def find_suite_id(project_code, suite_title):
     for offset in range(0, 1000, 100):
         resp = requests.get(
             f"{QASE_BASE}/suite/{project_code}",
@@ -69,8 +95,8 @@ def find_suite_id(project_code: str, suite_title: str):
     return None
 
 
-def list_cases_in_suite(project_code: str, suite_id: int) -> dict:
-    """Return {case_id: title} for every case in the suite."""
+def list_cases_in_suite(project_code, suite_id):
+    """Return {case_id: title}."""
     cases = {}
     for offset in range(0, 1000, 100):
         resp = requests.get(
@@ -88,8 +114,17 @@ def list_cases_in_suite(project_code: str, suite_id: int) -> dict:
     return cases
 
 
-def find_latest_run(project_code: str, jira_task_id: str):
-    """Return the most-recently-created run whose title contains the task ID."""
+def get_case_detail(project_code, case_id):
+    """Full case definition: steps, preconditions, expected_result."""
+    resp = requests.get(
+        f"{QASE_BASE}/case/{project_code}/{case_id}",
+        headers=qase_headers(),
+    )
+    resp.raise_for_status()
+    return resp.json().get("result") or {}
+
+
+def find_latest_run(project_code, jira_task_id):
     candidates = []
     for offset in range(0, 1000, 100):
         resp = requests.get(
@@ -106,14 +141,13 @@ def find_latest_run(project_code: str, jira_task_id: str):
             break
     if not candidates:
         return None
-    # Highest ID = most recent.
     candidates.sort(key=lambda r: r.get("id", 0), reverse=True)
     return candidates[0]
 
 
-def get_run_results(project_code: str, run_id: int) -> list:
-    """Return raw result entries for a run."""
-    out = []
+def get_run_results(project_code, run_id):
+    """Per-case latest result, keyed by case_id."""
+    raw = []
     for offset in range(0, 1000, 100):
         resp = requests.get(
             f"{QASE_BASE}/result/{project_code}",
@@ -122,38 +156,214 @@ def get_run_results(project_code: str, run_id: int) -> list:
         )
         resp.raise_for_status()
         entities = (resp.json().get("result") or {}).get("entities") or []
-        out.extend(entities)
+        raw.extend(entities)
         if len(entities) < 100:
             break
+    by_case = {}
+    for r in raw:
+        cid = r.get("case_id")
+        if cid is None or cid in by_case:
+            continue
+        by_case[cid] = r
+    return by_case
+
+
+def fetch_attachment_bytes(att):
+    """Qase results may attach files. Returns (filename, mime, bytes) or None."""
+    url = att.get("url")
+    if not url:
+        hash_ = att.get("hash")
+        if not hash_:
+            return None
+        meta = requests.get(f"{QASE_BASE}/attachment/{hash_}", headers=qase_headers())
+        if not meta.ok:
+            return None
+        url = (meta.json().get("result") or {}).get("url")
+        if not url:
+            return None
+    # The signed URL doesn't need the Qase token.
+    resp = requests.get(url, timeout=30)
+    if not resp.ok:
+        return None
+    return (
+        att.get("filename") or "attachment.bin",
+        att.get("mime") or "application/octet-stream",
+        resp.content,
+    )
+
+
+def collect_result_attachments(result):
+    """All attachments on a result, including ones nested under steps."""
+    out = list(result.get("attachments") or [])
+    for step in result.get("steps") or []:
+        out.extend(step.get("attachments") or [])
     return out
 
 
-# ── Report formatter ──────────────────────────────────────────────────────
+# ── Jira writes ───────────────────────────────────────────────────────────
 
-def build_report(project_code: str, jira_task_id: str, run: dict,
-                 results: list, case_titles: dict) -> str:
-    """Render the report body in Jira wiki markup."""
-    qase_run_url = f"https://app.qase.io/run/{project_code}/dashboard/{run['id']}"
+def jira_verify_or_raise(jira_base_url, issue_key):
+    """Run /myself + /issue first so errors are legible."""
+    base = jira_base_url.rstrip("/")
+    me = requests.get(f"{base}/rest/api/2/myself", headers=jira_headers())
+    if me.status_code in (401, 403):
+        print(f"Jira auth failed: HTTP {me.status_code}. Check JIRA_EMAIL/JIRA_API_TOKEN.",
+              file=sys.stderr)
+        me.raise_for_status()
+    me.raise_for_status()
 
-    # Per-case latest status (a case can have multiple result rows on retests;
-    # the API returns them newest-first, so the first occurrence wins).
+    issue = requests.get(
+        f"{base}/rest/api/2/issue/{issue_key}?fields=summary",
+        headers=jira_headers(),
+    )
+    if issue.status_code == 404:
+        print(f"Jira issue {issue_key} not visible. "
+              "Confirm the key exists and the JIRA_EMAIL user can browse it.",
+              file=sys.stderr)
+        issue.raise_for_status()
+    issue.raise_for_status()
+
+
+def post_jira_comment(jira_base_url, issue_key, body_text):
+    url = f"{jira_base_url.rstrip('/')}/rest/api/2/issue/{issue_key}/comment"
+    resp = requests.post(url, json={"body": body_text}, headers=jira_headers())
+    if resp.status_code not in (200, 201):
+        print(f"Jira comment POST failed: HTTP {resp.status_code}",
+              file=sys.stderr)
+        print(f"Response body: {resp.text[:500]}", file=sys.stderr)
+        resp.raise_for_status()
+    return resp.json()
+
+
+def create_jira_bug(jira_base_url, project_key, summary, description, labels=None):
+    payload = {
+        "fields": {
+            "project": {"key": project_key},
+            "summary": summary[:250],  # Jira limit
+            "issuetype": {"name": "Bug"},
+            "description": description,
+            "labels": labels or ["qa-automation", "from-qase"],
+        }
+    }
+    url = f"{jira_base_url.rstrip('/')}/rest/api/2/issue"
+    resp = requests.post(url, json=payload, headers=jira_headers())
+    if resp.status_code not in (200, 201):
+        print(f"Jira bug create failed: HTTP {resp.status_code} {resp.text[:500]}",
+              file=sys.stderr)
+        resp.raise_for_status()
+    return resp.json().get("key")
+
+
+def attach_to_jira(jira_base_url, issue_key, filename, content_bytes, mime_type):
+    """Multipart attachment upload. Needs X-Atlassian-Token: no-check."""
+    headers = {
+        "Authorization": "Basic " + jira_basic_auth(),
+        "X-Atlassian-Token": "no-check",
+        "Accept": "application/json",
+    }
+    files = {"file": (filename, content_bytes, mime_type)}
+    url = f"{jira_base_url.rstrip('/')}/rest/api/2/issue/{issue_key}/attachments"
+    resp = requests.post(url, headers=headers, files=files, timeout=60)
+    if not resp.ok:
+        print(f"Attach failed for {filename} on {issue_key}: "
+              f"HTTP {resp.status_code} {resp.text[:300]}", file=sys.stderr)
+        return False
+    return True
+
+
+def link_issues(jira_base_url, inward_key, outward_key, link_type="Relates"):
+    """Try to relate bug to parent. Best-effort — skip silently if link type missing."""
+    payload = {
+        "type": {"name": link_type},
+        "inwardIssue": {"key": inward_key},
+        "outwardIssue": {"key": outward_key},
+    }
+    url = f"{jira_base_url.rstrip('/')}/rest/api/2/issueLink"
+    resp = requests.post(url, json=payload, headers=jira_headers())
+    if not resp.ok:
+        print(f"Issue link {inward_key} → {outward_key} failed: HTTP {resp.status_code}",
+              file=sys.stderr)
+
+
+# ── Slack helpers ─────────────────────────────────────────────────────────
+
+def slack_client():
+    return WebClient(token=os.environ["SLACK_BOT_TOKEN"])
+
+
+def post_failure_action_prompt(channel, message_ts, jira_task_id, run_id, repo,
+                               passed, failed, qase_run_url):
+    """Two-button choice: create bug tickets or post a single comment."""
+    blocks = [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"🎉 *All test cases executed for {jira_task_id}.*\n"
+                    f"✅ Passed: *{passed}*  ·  ❌ Failed: *{failed}*\n"
+                    f"<{qase_run_url}|View run in Qase>\n\n"
+                    f"How should I handle the *{failed} failed* case(s)?"
+                ),
+            },
+        },
+        {
+            "type": "actions",
+            "block_id": f"qa_failure_action_{run_id}",
+            "elements": [
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "🐞 Create Bug Tickets"},
+                    "style": "danger",
+                    "action_id": "qa_create_bug_tickets",
+                    "value": json.dumps({
+                        "run_id": run_id,
+                        "jira_task_id": jira_task_id,
+                        "repo": repo,
+                    }),
+                },
+                {
+                    "type": "button",
+                    "text": {"type": "plain_text", "text": "📝 Post as Comment"},
+                    "action_id": "qa_post_comment_only",
+                    "value": json.dumps({
+                        "run_id": run_id,
+                        "jira_task_id": jira_task_id,
+                        "repo": repo,
+                    }),
+                },
+            ],
+        },
+    ]
+    slack_client().chat_postMessage(
+        channel=channel, thread_ts=message_ts, blocks=blocks,
+        text=f"{failed} failed case(s) for {jira_task_id} — choose how to report",
+    )
+
+
+def post_simple_thread_reply(channel, message_ts, text):
+    slack_client().chat_postMessage(channel=channel, thread_ts=message_ts, text=text)
+
+
+# ── Report builders ──────────────────────────────────────────────────────
+
+def aggregate(results_by_case, all_case_ids):
+    """Return (status_counts, case_status). Untested cases default to 'untested'."""
     case_status = {}
-    for r in results:
-        cid = r.get("case_id")
-        if cid is None or cid in case_status:
-            continue
+    for cid, r in results_by_case.items():
         case_status[cid] = r.get("status") or "untested"
-
-    # Anything in the suite that has no result row is reported as untested.
-    for cid in case_titles:
+    for cid in all_case_ids:
         case_status.setdefault(cid, "untested")
-
-    # Aggregate counts across the suite (not just rows that exist in results).
     counts = {}
-    for status in case_status.values():
-        counts[status] = counts.get(status, 0) + 1
-    total = sum(counts.values())
+    for s in case_status.values():
+        counts[s] = counts.get(s, 0) + 1
+    return counts, case_status
 
+
+def build_summary_comment(project_code, jira_task_id, run, results_by_case, case_titles):
+    qase_run_url = f"https://app.qase.io/run/{project_code}/dashboard/{run['id']}"
+    counts, case_status = aggregate(results_by_case, case_titles.keys())
+    total = sum(counts.values())
     run_title = run.get("title") or f"Run #{run['id']}"
 
     lines = [
@@ -167,100 +377,201 @@ def build_report(project_code: str, jira_task_id: str, run: dict,
     for status in STATUS_ORDER:
         n = counts.get(status, 0)
         if n:
-            label = status.replace("_", " ").title()
-            lines.append(f"|{STATUS_EMOJI.get(status, '•')} {label}|{n}|")
+            lines.append(
+                f"|{STATUS_EMOJI.get(status, '•')} "
+                f"{status.replace('_', ' ').title()}|{n}|"
+            )
     lines.append(f"|*Total*|*{total}*|")
     lines.append("")
     lines.append("h3. 📋 Per-case Results")
-
     for cid in sorted(case_titles.keys()):
         status = case_status.get(cid, "untested")
         emoji = STATUS_EMOJI.get(status, "•")
         case_url = f"https://app.qase.io/case/{project_code}-{cid}"
-        title = case_titles[cid]
-        lines.append(f"* {emoji} [{project_code}-{cid}|{case_url}] — {title}")
-
+        lines.append(f"* {emoji} [{project_code}-{cid}|{case_url}] — {case_titles[cid]}")
     return "\n".join(lines)
 
 
-# ── Jira write ────────────────────────────────────────────────────────────
+def build_bug_description(project_code, parent_key, qase_run_url, case, result):
+    case_url = f"https://app.qase.io/case/{project_code}-{case['id']}"
+    steps_md = ""
+    case_steps = case.get("steps") or []
+    if case_steps:
+        steps_md = "\n".join(f"# {s.get('action', '')}" for s in case_steps)
+    else:
+        steps_md = "_No steps recorded._"
 
-def post_jira_comment(jira_base_url: str, issue_key: str, body_text: str):
-    base = jira_base_url.rstrip("/")
+    expected = case.get("expected_result")
+    if not expected and case_steps:
+        # Some cases carry expected only on the last step.
+        expected = case_steps[-1].get("expected_result") or ""
+    if not expected:
+        expected = "_None recorded._"
 
-    # Step 1: who am I? /myself returns 200 only when basic-auth credentials
-    # are valid. This unambiguously distinguishes auth failures from issue
-    # / project visibility problems (Atlassian Cloud returns 404 for both
-    # "wrong creds" and "no permission to see issue").
-    me = requests.get(f"{base}/rest/api/2/myself", headers=jira_headers())
-    if me.status_code == 401 or me.status_code == 403:
-        print(
-            f"Jira auth failed: HTTP {me.status_code}. Check JIRA_EMAIL and "
-            f"JIRA_API_TOKEN — the email must match the API token owner.",
-            file=sys.stderr,
+    comment = result.get("comment") or "_No tester comment._"
+    preconditions = case.get("preconditions") or "_None._"
+
+    return "\n".join([
+        "*Auto-generated from a failed Qase test execution.*",
+        "",
+        f"*Parent issue:* {parent_key}",
+        f"*Qase case:* [{project_code}-{case['id']}|{case_url}]",
+        f"*Qase test run:* [Open in Qase|{qase_run_url}]",
+        "",
+        "h3. Preconditions",
+        preconditions,
+        "",
+        "h3. Steps",
+        steps_md,
+        "",
+        "h3. Expected Result",
+        expected,
+        "",
+        "h3. Tester's Comment",
+        comment,
+        "",
+        "h3. Status",
+        "❌ Failed",
+    ])
+
+
+def build_bug_summary_comment(jira_task_id, qase_run_url, created):
+    """Comment on parent issue after bugs are created."""
+    lines = [
+        f"h2. 🐞 Bug tickets created for failed cases — {jira_task_id}",
+        "",
+        f"*Source:* [Qase test run|{qase_run_url}]",
+        "",
+        "||Bug||Failed Case||",
+    ]
+    for entry in created:
+        lines.append(f"|{entry['bug_key']}|{entry['case_title']}|")
+    return "\n".join(lines)
+
+
+# ── Mode runners ──────────────────────────────────────────────────────────
+
+def run_comment_mode(args, ctx):
+    body = build_summary_comment(
+        ctx["project_code"], args.jira_task, ctx["run"],
+        ctx["results"], ctx["case_titles"],
+    )
+    print("─── Comment body ─────────────────────")
+    print(body)
+    print("──────────────────────────────────────")
+    post_jira_comment(ctx["jira_base_url"], args.jira_task, body)
+    print(f"✅ Posted report comment on {args.jira_task}")
+
+    if args.message_ts:
+        post_simple_thread_reply(
+            os.environ["SLACK_CHANNEL_ID"], args.message_ts,
+            f"📊 Test report posted on <{ctx['jira_base_url']}/browse/{args.jira_task}|{args.jira_task}>.",
         )
-        me.raise_for_status()
-    if me.status_code == 404:
-        # If even /myself is 404, the base URL itself is wrong.
-        print(
-            "Jira /myself returned 404. JIRA_BASE_URL is almost certainly "
-            "wrong. It should be like 'https://your-tenant.atlassian.net' "
-            "(no trailing slash, no /jira, no /wiki).",
-            file=sys.stderr,
-        )
-        me.raise_for_status()
-    me.raise_for_status()
-    me_data = me.json()
-    print(f"Jira auth OK as: {me_data.get('displayName')} ({me_data.get('emailAddress', 'email hidden')})")
 
-    # Step 2: can we see this specific issue?
-    probe_url = f"{base}/rest/api/2/issue/{issue_key}?fields=summary"
-    probe = requests.get(probe_url, headers=jira_headers())
-    if probe.status_code == 404:
-        # Help the user figure out what project keys actually exist.
-        try:
-            projects_resp = requests.get(
-                f"{base}/rest/api/2/project",
-                headers=jira_headers(),
+
+def run_bug_tickets_mode(args, ctx):
+    """Create one Jira bug per failed case, then summary comment on the parent."""
+    project_key = args.jira_task.split("-")[0]
+    qase_run_url = f"https://app.qase.io/run/{ctx['project_code']}/dashboard/{ctx['run']['id']}"
+
+    failures = [
+        (cid, ctx["results"][cid]) for cid in ctx["case_titles"]
+        if ctx["results"].get(cid) and ctx["results"][cid].get("status") == "failed"
+    ]
+    if not failures:
+        msg = f"No failed cases on the latest run for {args.jira_task}. Nothing to do."
+        print(msg)
+        if args.message_ts:
+            post_simple_thread_reply(
+                os.environ["SLACK_CHANNEL_ID"], args.message_ts, "✅ " + msg,
             )
-            if projects_resp.ok:
-                projects = projects_resp.json() or []
-                listed = ", ".join(
-                    f"{p.get('key')} ({p.get('name')})" for p in projects[:20]
-                ) or "(none)"
-                print(f"Jira projects visible to {me_data.get('emailAddress', 'you')}: {listed}",
-                      file=sys.stderr)
-        except Exception:
-            pass
-        print(
-            f"Jira issue '{issue_key}' not found / not visible. Either:\n"
-            f"  - The project key in '{issue_key}' is wrong (see the list above)\n"
-            f"  - That specific issue number doesn't exist yet",
-            file=sys.stderr,
+        return
+
+    created = []
+    for case_id, result in failures:
+        case = get_case_detail(ctx["project_code"], case_id) or {"id": case_id}
+        case.setdefault("id", case_id)
+        title = case.get("title") or ctx["case_titles"].get(case_id, f"Case #{case_id}")
+        summary = f"[QA] {title} — failed in {args.jira_task}"
+        description = build_bug_description(
+            ctx["project_code"], args.jira_task, qase_run_url, case, result,
         )
-        probe.raise_for_status()
-    probe.raise_for_status()
-    print(f"Jira issue {issue_key} visible — '{probe.json().get('fields', {}).get('summary', '')}'")
+        bug_key = create_jira_bug(ctx["jira_base_url"], project_key, summary, description)
+        print(f"  🐞 Created {bug_key} for case #{case_id} — {title}")
 
-    url = f"{base}/rest/api/2/issue/{issue_key}/comment"
-    resp = requests.post(url, json={"body": body_text}, headers=jira_headers())
-    if resp.status_code not in (200, 201):
-        # Strip the body text so the print doesn't trigger secret-masking on
-        # the URL, which would obscure the diagnostic.
-        print(f"Jira comment POST failed: HTTP {resp.status_code}",
-              file=sys.stderr)
-        print(f"Response body: {resp.text[:500]}", file=sys.stderr)
-        resp.raise_for_status()
-    return resp.json()
+        # Attach any Qase result attachments to the new bug (best-effort).
+        for att in collect_result_attachments(result):
+            payload = fetch_attachment_bytes(att)
+            if not payload:
+                continue
+            fname, mime, content = payload
+            ok = attach_to_jira(ctx["jira_base_url"], bug_key, fname, content, mime)
+            if ok:
+                print(f"     attached {fname}")
 
+        # Best-effort link back to the parent story.
+        link_issues(ctx["jira_base_url"], bug_key, args.jira_task)
+
+        created.append({"bug_key": bug_key, "case_id": case_id, "case_title": title})
+
+    summary_body = build_bug_summary_comment(args.jira_task, qase_run_url, created)
+    post_jira_comment(ctx["jira_base_url"], args.jira_task, summary_body)
+    print(f"✅ Created {len(created)} bug ticket(s) and posted summary on {args.jira_task}")
+
+    if args.message_ts:
+        bug_links = ", ".join(
+            f"<{ctx['jira_base_url']}/browse/{c['bug_key']}|{c['bug_key']}>"
+            for c in created
+        )
+        post_simple_thread_reply(
+            os.environ["SLACK_CHANNEL_ID"], args.message_ts,
+            f"🐞 Created {len(created)} bug ticket(s) for *{args.jira_task}*: {bug_links}",
+        )
+
+
+def run_router_mode(args, ctx):
+    counts, _ = aggregate(ctx["results"], ctx["case_titles"].keys())
+    failed = counts.get("failed", 0)
+    untested = counts.get("untested", 0) + counts.get("in_progress", 0)
+    qase_run_url = f"https://app.qase.io/run/{ctx['project_code']}/dashboard/{ctx['run']['id']}"
+
+    print(f"Router decision input: failed={failed}, not-yet-executed={untested}, "
+          f"all_counts={counts}")
+
+    # The user wants the prompt only when execution is 100% complete AND
+    # there are failures to make a decision about. Any other path falls
+    # straight through to the existing comment behavior.
+    if untested == 0 and failed > 0 and args.message_ts:
+        passed = counts.get("passed", 0)
+        post_failure_action_prompt(
+            os.environ["SLACK_CHANNEL_ID"], args.message_ts,
+            args.jira_task, args.run_id or "manual",
+            args.repo or os.environ.get("GITHUB_REPOSITORY", ""),
+            passed, failed, qase_run_url,
+        )
+        print(f"Posted failure-action prompt to Slack ({failed} failures).")
+        return
+
+    # Default: post the comment immediately.
+    run_comment_mode(args, ctx)
+
+
+# ── Entry point ──────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", default="auto-router",
+                        choices=["auto-router", "comment", "bug-tickets"])
     parser.add_argument("--jira-task", required=True)
+    parser.add_argument("--message-ts", help="Slack message ts for thread replies / prompts.")
+    parser.add_argument("--run-id", help="GitHub Actions run ID (used in Slack button payloads).")
+    parser.add_argument("--repo", help="GitHub repo (used in Slack button payloads).")
     args = parser.parse_args()
 
     project_code = os.environ.get("QASE_PROJECT_CODE") or args.jira_task.split("-")[0]
     jira_base_url = os.environ["JIRA_BASE_URL"]
+
+    jira_verify_or_raise(jira_base_url, args.jira_task)
 
     suite_id = find_suite_id(project_code, args.jira_task)
     if suite_id is None:
@@ -275,20 +586,27 @@ def main():
 
     run = find_latest_run(project_code, args.jira_task)
     if run is None:
-        print(f"No Qase test run found for '{args.jira_task}'. Create a test run first.",
+        print(f"No Qase test run found for '{args.jira_task}'. Create one first.",
               file=sys.stderr)
         sys.exit(1)
+    print(f"Latest Qase run: #{run['id']} — {run.get('title')}")
 
-    print(f"Reporting on Qase run #{run['id']} — {run.get('title')}")
     results = get_run_results(project_code, run["id"])
 
-    body = build_report(project_code, args.jira_task, run, results, case_titles)
-    print("─── Report body ─────────────────────")
-    print(body)
-    print("─────────────────────────────────────")
+    ctx = {
+        "project_code": project_code,
+        "jira_base_url": jira_base_url,
+        "run": run,
+        "results": results,
+        "case_titles": case_titles,
+    }
 
-    post_jira_comment(jira_base_url, args.jira_task, body)
-    print(f"✅ Posted report comment on Jira issue {args.jira_task}")
+    if args.mode == "auto-router":
+        run_router_mode(args, ctx)
+    elif args.mode == "comment":
+        run_comment_mode(args, ctx)
+    elif args.mode == "bug-tickets":
+        run_bug_tickets_mode(args, ctx)
 
 
 if __name__ == "__main__":

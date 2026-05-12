@@ -10,6 +10,8 @@ on:
       - slack_create_test_run
       - slack_skip_test_run
       - slack_post_jira_report
+      - slack_create_bug_tickets
+      - slack_post_comment_only
 
 # Opt every JS-based action into Node 24 ahead of the June 2026 forced cutover.
 # https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
@@ -167,29 +169,64 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-      # ── POST JIRA REPORT ─────────────────────────────────────────────────
-      # Reads the latest Qase run for this Jira task and posts a summary
-      # comment on the issue. Stateless — talks to Qase + Jira directly.
-      - name: Post test report to Jira
+      # ── POST JIRA REPORT (router) ────────────────────────────────────────
+      # auto-router decides at runtime:
+      #   * all cases executed AND any failures → posts a Slack prompt
+      #     asking how to handle them (bug tickets vs. plain comment).
+      #   * otherwise → posts the wiki-markup comment on the Jira issue
+      #     immediately (with a Slack confirmation reply).
+      - name: Route Jira report (comment vs. bug-ticket prompt)
         if: github.event.action == 'slack_post_jira_report'
         run: |
           python3 scripts/report_to_jira.py \
-            --jira-task "${{ github.event.client_payload.jira_task_id }}"
+            --mode auto-router \
+            --jira-task "${{ github.event.client_payload.jira_task_id }}" \
+            --message-ts "${{ github.event.client_payload.message_ts }}" \
+            --run-id "${{ github.event.client_payload.run_id }}" \
+            --repo "${{ github.repository }}"
         env:
           QASE_API_TOKEN: ${{ secrets.QASE_API_TOKEN }}
           QASE_PROJECT_CODE: ${{ secrets.QASE_PROJECT_CODE }}
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-      - name: Notify — Jira report posted
-        if: github.event.action == 'slack_post_jira_report'
+      # ── CREATE BUG TICKETS (failures → one Jira bug each) ────────────────
+      - name: Create Jira bug tickets for failed cases
+        if: github.event.action == 'slack_create_bug_tickets'
         run: |
-          python3 scripts/post_to_slack.py \
-            --mode jira-report-posted \
+          python3 scripts/report_to_jira.py \
+            --mode bug-tickets \
             --jira-task "${{ github.event.client_payload.jira_task_id }}" \
             --message-ts "${{ github.event.client_payload.message_ts }}" \
+            --run-id "${{ github.event.client_payload.run_id }}" \
             --repo "${{ github.repository }}"
         env:
+          QASE_API_TOKEN: ${{ secrets.QASE_API_TOKEN }}
+          QASE_PROJECT_CODE: ${{ secrets.QASE_PROJECT_CODE }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
+      # ── POST COMMENT ONLY (failures kept as one comment) ─────────────────
+      - name: Post Jira summary comment only
+        if: github.event.action == 'slack_post_comment_only'
+        run: |
+          python3 scripts/report_to_jira.py \
+            --mode comment \
+            --jira-task "${{ github.event.client_payload.jira_task_id }}" \
+            --message-ts "${{ github.event.client_payload.message_ts }}" \
+            --run-id "${{ github.event.client_payload.run_id }}" \
+            --repo "${{ github.repository }}"
+        env:
+          QASE_API_TOKEN: ${{ secrets.QASE_API_TOKEN }}
+          QASE_PROJECT_CODE: ${{ secrets.QASE_PROJECT_CODE }}
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
