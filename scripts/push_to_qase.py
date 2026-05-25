@@ -155,7 +155,25 @@ def create_test_run(project_code: str, jira_task_id: str, case_ids: list) -> str
         json=payload,
         headers=headers,
     )
-    resp.raise_for_status()
+
+    if not resp.ok:
+        # Surface the actual Qase error body. raise_for_status() drops it
+        # by default, which is what made the previous 403 unintelligible.
+        # Common causes for 403 here:
+        #   - The token's role lacks the "Test Runs: Create" permission
+        #     (a role can have case-create rights but not run-create rights,
+        #     which is why Push Approved to Qase succeeded but this failed)
+        #   - Free plan's test-run quota exhausted on this project
+        #   - Project code mismatch (token belongs to a different workspace)
+        body_preview = resp.text[:500] if resp.text else "(empty body)"
+        print(
+            f"Qase create-run failed: HTTP {resp.status_code}\n"
+            f"Project code: {project_code!r}\n"
+            f"Case IDs: {case_ids}\n"
+            f"Response body: {body_preview}",
+            file=sys.stderr,
+        )
+        resp.raise_for_status()
 
     run_id = resp.json().get("result", {}).get("id")
     print(f"Created test run: #{run_id}")
