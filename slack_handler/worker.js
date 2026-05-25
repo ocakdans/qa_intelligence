@@ -7,7 +7,12 @@
  * the artifact-cross-run race that was losing approvals when buttons were
  * clicked rapidly.
  *
- * KV layout: state:{run_id} → { approved_ids: number[], rejected_ids: number[] }
+ * KV layout: state:{run_id} → {
+ *   approved_ids: number[],
+ *   rejected_ids: number[],
+ *   approved_by:  { [tc_id]: username },   // who approved each case
+ *   rejected_by:  { [tc_id]: username },   // who rejected each case
+ * }
  *
  * Deploy: wrangler deploy
  * Bindings:
@@ -86,8 +91,10 @@ export default {
 
       let state;
       if (STATE_ACTIONS.has(actionId)) {
-        // Approve/Reject — mutate state in KV before dispatching.
-        state = await applyClick(env, value.run_id, actionId, parseInt(value.tc_id, 10));
+        // Approve/Reject — mutate state in KV before dispatching. Capture
+        // who clicked so we can attribute the action in the Slack repaint.
+        const clicker = pickUsername(payload.user);
+        state = await applyClick(env, value.run_id, actionId, parseInt(value.tc_id, 10), clicker);
       } else {
         // Push / Create-test-run / Skip — read-only, take whatever's persisted.
         state = await readState(env, value.run_id);
@@ -99,6 +106,8 @@ export default {
         channel_id: channelId,
         approved_ids: state.approved_ids,
         rejected_ids: state.rejected_ids,
+        approved_by: state.approved_by,
+        rejected_by: state.rejected_by,
       }, env);
 
       return new Response("", { status: 200 });
@@ -126,6 +135,8 @@ export default {
         expected,
         approved_ids: state.approved_ids,
         rejected_ids: state.rejected_ids,
+        approved_by: state.approved_by,
+        rejected_by: state.rejected_by,
       }, env);
 
       return new Response(JSON.stringify({ response_action: "clear" }), {
@@ -140,7 +151,12 @@ export default {
 // ── KV state helpers ──────────────────────────────────────────────────
 
 const STATE_KEY = (runId) => `state:${runId}`;
-const EMPTY_STATE = () => ({ approved_ids: [], rejected_ids: [] });
+const EMPTY_STATE = () => ({
+  approved_ids: [],
+  rejected_ids: [],
+  approved_by: {},
+  rejected_by: {},
+});
 
 async function readState(env, runId) {
   if (!runId) return EMPTY_STATE();
@@ -151,10 +167,26 @@ async function readState(env, runId) {
     return {
       approved_ids: Array.isArray(parsed.approved_ids) ? parsed.approved_ids : [],
       rejected_ids: Array.isArray(parsed.rejected_ids) ? parsed.rejected_ids : [],
+      // Backward-compat: older KV entries don't have the attribution maps.
+      approved_by: isPlainObject(parsed.approved_by) ? parsed.approved_by : {},
+      rejected_by: isPlainObject(parsed.rejected_by) ? parsed.rejected_by : {},
     };
   } catch {
     return EMPTY_STATE();
   }
+}
+
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
+
+/**
+ * Pull a human-readable handle off a Slack interactivity `user` object.
+ * Prefer username, fall back to name, finally to id.
+ */
+function pickUsername(user) {
+  if (!user) return "user";
+  return user.username || user.name || user.id || "user";
 }
 
 /**
@@ -162,22 +194,32 @@ async function readState(env, runId) {
  * new state. KV doesn't support real CAS, so we minimize the read-write
  * window by doing nothing else between the read and the put.
  */
-async function applyClick(env, runId, actionId, tcId) {
+async function applyClick(env, runId, actionId, tcId, clicker) {
   const state = await readState(env, runId);
   const approved = new Set(state.approved_ids);
   const rejected = new Set(state.rejected_ids);
+  const approvedBy = { ...state.approved_by };
+  const rejectedBy = { ...state.rejected_by };
+
+  const key = String(tcId);
 
   if (actionId === "qa_approve_tc") {
     approved.add(tcId);
     rejected.delete(tcId);
+    approvedBy[key] = clicker || "user";
+    delete rejectedBy[key];
   } else if (actionId === "qa_reject_tc") {
     rejected.add(tcId);
     approved.delete(tcId);
+    rejectedBy[key] = clicker || "user";
+    delete approvedBy[key];
   }
 
   const next = {
     approved_ids: [...approved].sort((a, b) => a - b),
     rejected_ids: [...rejected].sort((a, b) => a - b),
+    approved_by: approvedBy,
+    rejected_by: rejectedBy,
   };
 
   await env.QA_STATE.put(STATE_KEY(runId), JSON.stringify(next));

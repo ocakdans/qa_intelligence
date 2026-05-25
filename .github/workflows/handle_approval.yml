@@ -69,7 +69,9 @@ jobs:
             --message-ts "${{ github.event.client_payload.message_ts }}" \
             --repo "${{ github.repository }}" \
             --approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
-            --rejected-ids '${{ toJson(github.event.client_payload.rejected_ids) }}'
+            --rejected-ids '${{ toJson(github.event.client_payload.rejected_ids) }}' \
+            --approved-by-json '${{ toJson(github.event.client_payload.approved_by) }}' \
+            --rejected-by-json '${{ toJson(github.event.client_payload.rejected_by) }}'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
@@ -117,7 +119,9 @@ jobs:
             --message-ts "${{ github.event.client_payload.message_ts }}" \
             --repo "${{ github.repository }}" \
             --approved-ids '${{ toJson(github.event.client_payload.approved_ids) }}' \
-            --rejected-ids '${{ toJson(github.event.client_payload.rejected_ids) }}'
+            --rejected-ids '${{ toJson(github.event.client_payload.rejected_ids) }}' \
+            --approved-by-json '${{ toJson(github.event.client_payload.approved_by) }}' \
+            --rejected-by-json '${{ toJson(github.event.client_payload.rejected_by) }}'
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}

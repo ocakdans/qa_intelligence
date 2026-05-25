@@ -32,8 +32,30 @@ def _parse_id_list(raw):
     return set(parsed)
 
 
+def _parse_id_map(raw):
+    """Parse a JSON object mapping case_id -> username. Returns {} when
+    missing or malformed (caller can still render without attribution)."""
+    if raw is None or raw == "" or raw.strip().lower() == "null":
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    # Normalize keys to int so callers can look up by tc["id"] directly.
+    out = {}
+    for k, v in parsed.items():
+        try:
+            out[int(k)] = str(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str,
-                           approved_ids: set = None, rejected_ids: set = None) -> list:
+                           approved_ids: set = None, rejected_ids: set = None,
+                           approved_by: dict = None, rejected_by: dict = None) -> list:
     test_cases = data.get("test_cases", [])
     # CLI/payload overrides win; the artifact JSON is just the fallback for
     # backwards compatibility.
@@ -41,9 +63,21 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
         approved_ids = set(data.get("approved_ids", []))
     if rejected_ids is None:
         rejected_ids = set(data.get("rejected_ids", []))
+    approved_by = approved_by or {}
+    rejected_by = rejected_by or {}
 
-    # Only show non-rejected test cases
-    visible = [tc for tc in test_cases if tc["id"] not in rejected_ids]
+    # Show every case — rejected ones stay visible with a clear indicator so
+    # reviewers see the full audit trail rather than cases vanishing on click.
+    total = len(test_cases)
+    n_approved = sum(1 for tc in test_cases if tc["id"] in approved_ids)
+    n_rejected = sum(1 for tc in test_cases if tc["id"] in rejected_ids)
+    n_pending = total - n_approved - n_rejected
+
+    summary = (
+        f"*<{JIRA_BASE_URL}/browse/{jira_task_id}|{jira_task_id}>* · "
+        f"{total} test case(s) · "
+        f"✅ {n_approved} approved · ❌ {n_rejected} rejected · ⏳ {n_pending} pending"
+    )
 
     blocks = [
         {
@@ -52,19 +86,14 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
         },
         {
             "type": "section",
-            "text": {
-                "type": "mrkdwn",
-                "text": (
-                    f"*<{JIRA_BASE_URL}/browse/{jira_task_id}|{jira_task_id}>* · "
-                    f"{len(visible)} test case(s) · Review each one below."
-                ),
-            },
+            "text": {"type": "mrkdwn", "text": summary},
         },
         {"type": "divider"},
     ]
 
-    for tc in visible:
+    for tc in test_cases:
         is_approved = tc["id"] in approved_ids
+        is_rejected = tc["id"] in rejected_ids
         type_emoji = {"positive": "🟢", "negative": "🔴", "edge_case": "⚠️"}.get(tc["type"], "•")
         steps_text = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(tc["steps"]))
 
@@ -84,10 +113,22 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
         )
 
         if is_approved:
-            # Replace buttons with a clear approved indicator
+            who = approved_by.get(tc["id"], "user")
             blocks.append({
                 "type": "context",
-                "elements": [{"type": "mrkdwn", "text": "✅ *Approved* — will be pushed to Qase"}],
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": f"✅ *APPROVED* [case:{tc['id']}] by `{who}`",
+                }],
+            })
+        elif is_rejected:
+            who = rejected_by.get(tc["id"], "user")
+            blocks.append({
+                "type": "context",
+                "elements": [{
+                    "type": "mrkdwn",
+                    "text": f"❌ *REJECTED* [case:{tc['id']}] by `{who}`",
+                }],
             })
         else:
             blocks.append(
@@ -165,12 +206,16 @@ def build_test_case_blocks(data: dict, jira_task_id: str, run_id: str, repo: str
 
 def post_test_cases(client: WebClient, channel: str, test_cases_path: str,
                     jira_task_id: str, run_id: str, repo: str, message_ts: str = None,
-                    approved_ids: set = None, rejected_ids: set = None):
+                    approved_ids: set = None, rejected_ids: set = None,
+                    approved_by: dict = None, rejected_by: dict = None):
     with open(test_cases_path) as f:
         data = json.load(f)
 
-    blocks = build_test_case_blocks(data, jira_task_id, run_id, repo,
-                                    approved_ids=approved_ids, rejected_ids=rejected_ids)
+    blocks = build_test_case_blocks(
+        data, jira_task_id, run_id, repo,
+        approved_ids=approved_ids, rejected_ids=rejected_ids,
+        approved_by=approved_by, rejected_by=rejected_by,
+    )
 
     if message_ts:
         client.chat_update(
@@ -293,6 +338,10 @@ def main():
                         help="JSON array of approved IDs (overrides the artifact). Source of truth in KV.")
     parser.add_argument("--rejected-ids",
                         help="JSON array of rejected IDs (overrides the artifact). Source of truth in KV.")
+    parser.add_argument("--approved-by-json",
+                        help="JSON object {case_id: username} for approval attribution.")
+    parser.add_argument("--rejected-by-json",
+                        help="JSON object {case_id: username} for rejection attribution.")
     args = parser.parse_args()
 
     client = WebClient(token=os.environ["SLACK_BOT_TOKEN"])
@@ -300,11 +349,14 @@ def main():
 
     approved_override = _parse_id_list(args.approved_ids)
     rejected_override = _parse_id_list(args.rejected_ids)
+    approved_by = _parse_id_map(args.approved_by_json)
+    rejected_by = _parse_id_map(args.rejected_by_json)
 
     if args.mode == "review":
         post_test_cases(client, channel, args.test_cases, args.jira_task,
                         args.run_id, args.repo, args.message_ts,
-                        approved_ids=approved_override, rejected_ids=rejected_override)
+                        approved_ids=approved_override, rejected_ids=rejected_override,
+                        approved_by=approved_by, rejected_by=rejected_by)
 
     elif args.mode in ("tc-approved", "tc-rejected"):
         # Look up the TC title from the artifact
