@@ -86,3 +86,16 @@ jobs:
         env:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
+      # Cache the test case content in the Worker's KV so subsequent
+      # Approve/Reject clicks can be repainted in ~300ms instead of
+      # going through a 15-20s GitHub Actions cold start round trip.
+      - name: Seed test cases to Worker cache (fast Slack updates)
+        if: env.WORKER_URL != '' && env.INTERNAL_WEBHOOK_SECRET != ''
+        run: |
+          python3 scripts/seed_cases_to_worker.py \
+            --test-cases test_cases.json \
+            --run-id "${{ github.run_id }}"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          INTERNAL_WEBHOOK_SECRET: ${{ secrets.INTERNAL_WEBHOOK_SECRET }}

@@ -7,12 +7,17 @@
  * the artifact-cross-run race that was losing approvals when buttons were
  * clicked rapidly.
  *
- * KV layout: state:{run_id} → {
- *   approved_ids: number[],
- *   rejected_ids: number[],
- *   approved_by:  { [tc_id]: username },   // who approved each case
- *   rejected_by:  { [tc_id]: username },   // who rejected each case
- * }
+ * KV layout:
+ *   state:{run_id} → {
+ *     approved_ids: number[],
+ *     rejected_ids: number[],
+ *     approved_by:  { [tc_id]: username },   // who approved each case
+ *     rejected_by:  { [tc_id]: username },   // who rejected each case
+ *   }
+ *   cases:{run_id} → TestCase[]              // cached test case content
+ *                                            // (lets the Worker render Slack
+ *                                            // updates directly, skipping
+ *                                            // the GitHub Actions cold start)
  *
  * Deploy: wrangler deploy
  * Bindings:
@@ -51,6 +56,16 @@ export default {
     // shared secret in the X-Webhook-Secret header.
     if (url.pathname === "/jira-webhook") {
       return handleJiraWebhook(request, env);
+    }
+
+    // ── Internal: seed test case content ───────────────────────────
+    // Called by the generate / add-test-case workflows to cache the
+    // test_cases array in KV so the Worker can render Slack updates
+    // for Approve/Reject directly, without a 15-20s GitHub Actions
+    // round trip. Auth is a separate shared secret in the
+    // X-Webhook-Secret header.
+    if (url.pathname === "/seed-cases") {
+      return handleSeedCases(request, env);
     }
 
     // ── Slack interactivity (default) ──────────────────────────────
@@ -95,6 +110,24 @@ export default {
         // who clicked so we can attribute the action in the Slack repaint.
         const clicker = pickUsername(payload.user);
         state = await applyClick(env, value.run_id, actionId, parseInt(value.tc_id, 10), clicker);
+
+        // ── Fast path ────────────────────────────────────────────────
+        // If we've cached the test case content for this run, render and
+        // update Slack directly here. Slack update lands in ~300ms
+        // instead of ~20s (GitHub Actions cold start). Falls through to
+        // the GitHub dispatch below only if the cache miss or the Slack
+        // call fails — defensive backstop.
+        const cases = await readCases(env, value.run_id);
+        if (cases) {
+          const blocks = renderTestCaseBlocks(
+            cases, value.jira_task_id, value.run_id, value.repo, state
+          );
+          const ok = await updateSlackMessage(
+            channelId, messageTs, blocks,
+            `Test Cases — ${value.jira_task_id}`, env
+          );
+          if (ok) return new Response("", { status: 200 });
+        }
       } else {
         // Push / Create-test-run / Skip — read-only, take whatever's persisted.
         state = await readState(env, value.run_id);
@@ -307,6 +340,225 @@ async function openAddTestCaseModal(triggerId, value, messageTs, channelId, stat
     },
     body: JSON.stringify({ trigger_id: triggerId, view: modal }),
   });
+}
+
+// ── Case content cache (KV) ──────────────────────────────────────────
+
+const CASES_KEY = (runId) => `cases:${runId}`;
+
+async function readCases(env, runId) {
+  if (!runId) return null;
+  const raw = await env.QA_STATE.get(CASES_KEY(runId));
+  if (!raw) return null;
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+async function writeCases(env, runId, cases) {
+  if (!runId || !Array.isArray(cases)) return false;
+  // Cache for 30 days — long enough to cover any in-flight review cycle
+  // but auto-expires so unused entries don't accumulate forever.
+  await env.QA_STATE.put(CASES_KEY(runId), JSON.stringify(cases), {
+    expirationTtl: 60 * 60 * 24 * 30,
+  });
+  return true;
+}
+
+// ── Internal /seed-cases endpoint ────────────────────────────────────
+
+async function handleSeedCases(request, env) {
+  const supplied = request.headers.get("X-Webhook-Secret");
+  if (!env.INTERNAL_WEBHOOK_SECRET || !supplied ||
+      !constantTimeEquals(supplied, env.INTERNAL_WEBHOOK_SECRET)) {
+    return new Response("Unauthorized", { status: 401 });
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return new Response("Bad Request: body must be JSON", { status: 400 });
+  }
+
+  const runId = payload.run_id;
+  const cases = payload.cases;
+  if (!runId || !Array.isArray(cases)) {
+    return new Response("Bad Request: missing run_id or cases", { status: 400 });
+  }
+
+  await writeCases(env, String(runId), cases);
+  return new Response(JSON.stringify({ ok: true, cached: cases.length }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+// ── Slack message rendering & update ─────────────────────────────────
+
+const JIRA_BASE_URL = "https://selimocakdan.atlassian.net";
+
+const TYPE_EMOJI = { positive: "🟢", negative: "🔴", edge_case: "⚠️" };
+
+/**
+ * Port of post_to_slack.py:build_test_case_blocks — keep these two in
+ * sync. The Worker uses this for the fast Approve/Reject repaint;
+ * the Python version still handles add-test-case and any cold-path
+ * fallbacks.
+ */
+function renderTestCaseBlocks(cases, jiraTaskId, runId, repo, state) {
+  const approved = new Set(state.approved_ids || []);
+  const rejected = new Set(state.rejected_ids || []);
+  const approvedBy = state.approved_by || {};
+  const rejectedBy = state.rejected_by || {};
+
+  const total = cases.length;
+  let nApproved = 0, nRejected = 0;
+  for (const tc of cases) {
+    if (approved.has(tc.id)) nApproved++;
+    else if (rejected.has(tc.id)) nRejected++;
+  }
+  const nPending = total - nApproved - nRejected;
+
+  const summary =
+    `*<${JIRA_BASE_URL}/browse/${jiraTaskId}|${jiraTaskId}>* · ${total} test case(s) · ` +
+    `✅ ${nApproved} approved · ❌ ${nRejected} rejected · ⏳ ${nPending} pending`;
+
+  const blocks = [
+    { type: "header", text: { type: "plain_text", text: `🧪 Test Cases — ${jiraTaskId}` } },
+    { type: "section", text: { type: "mrkdwn", text: summary } },
+    { type: "divider" },
+  ];
+
+  for (const tc of cases) {
+    const isApproved = approved.has(tc.id);
+    const isRejected = rejected.has(tc.id);
+    const emoji = TYPE_EMOJI[tc.type] || "•";
+    const stepsText = (tc.steps || []).map((s, i) => `  ${i + 1}. ${s}`).join("\n");
+
+    blocks.push({
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text:
+          `${emoji} *TC-${tc.id}: ${tc.title}*\n` +
+          `*Preconditions:* ${tc.preconditions || "None"}\n` +
+          `*Steps:*\n${stepsText}\n` +
+          `*Expected:* ${tc.expected_result}`,
+      },
+    });
+
+    if (isApproved) {
+      const who = approvedBy[String(tc.id)] || "user";
+      blocks.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: `✅ *APPROVED* [case:${tc.id}] by \`${who}\`` }],
+      });
+    } else if (isRejected) {
+      const who = rejectedBy[String(tc.id)] || "user";
+      blocks.push({
+        type: "context",
+        elements: [{ type: "mrkdwn", text: `❌ *REJECTED* [case:${tc.id}] by \`${who}\`` }],
+      });
+    } else {
+      const buttonValue = JSON.stringify({
+        run_id: runId,
+        jira_task_id: jiraTaskId,
+        repo,
+        tc_id: tc.id,
+        approved_ids: [...approved],
+      });
+      blocks.push({
+        type: "actions",
+        block_id: `tc_${runId}_${tc.id}`,
+        elements: [
+          {
+            type: "button",
+            text: { type: "plain_text", text: "✅ Approve" },
+            style: "primary",
+            action_id: "qa_approve_tc",
+            value: buttonValue,
+          },
+          {
+            type: "button",
+            text: { type: "plain_text", text: "❌ Reject" },
+            style: "danger",
+            action_id: "qa_reject_tc",
+            value: buttonValue,
+          },
+        ],
+      });
+    }
+
+    blocks.push({ type: "divider" });
+  }
+
+  // Bottom action bar
+  blocks.push({
+    type: "actions",
+    block_id: `qa_bottom_${runId}`,
+    elements: [
+      {
+        type: "button",
+        text: { type: "plain_text", text: "🚀 Push Approved to Qase" },
+        style: "primary",
+        action_id: "qa_push_to_qase",
+        value: JSON.stringify({
+          run_id: runId,
+          jira_task_id: jiraTaskId,
+          repo,
+          approved_ids: [...approved],
+        }),
+      },
+      {
+        type: "button",
+        text: { type: "plain_text", text: "➕ Add Test Case" },
+        action_id: "qa_add_test_case",
+        value: JSON.stringify({
+          run_id: runId,
+          jira_task_id: jiraTaskId,
+          repo,
+        }),
+      },
+    ],
+  });
+
+  return blocks;
+}
+
+async function updateSlackMessage(channelId, messageTs, blocks, fallbackText, env) {
+  if (!channelId || !messageTs) return false;
+  try {
+    const resp = await fetch("https://slack.com/api/chat.update", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.SLACK_BOT_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        channel: channelId,
+        ts: messageTs,
+        blocks,
+        text: fallbackText,
+      }),
+    });
+    if (!resp.ok) {
+      console.error(`Slack chat.update HTTP ${resp.status}: ${await resp.text()}`);
+      return false;
+    }
+    const data = await resp.json();
+    if (!data.ok) {
+      console.error(`Slack chat.update API error: ${JSON.stringify(data)}`);
+      return false;
+    }
+    return true;
+  } catch (err) {
+    console.error(`Slack chat.update threw: ${err && err.message}`);
+    return false;
+  }
 }
 
 // ── Jira webhook handler ─────────────────────────────────────────────

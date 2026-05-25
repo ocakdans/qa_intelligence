@@ -135,6 +135,18 @@ jobs:
           overwrite: true
           retention-days: 7
 
+      # Re-seed the Worker's case cache after a manual add so the next
+      # Approve/Reject click renders against the updated case list.
+      - name: Re-seed test cases to Worker cache
+        if: github.event.action == 'slack_add_test_case' && env.WORKER_URL != '' && env.INTERNAL_WEBHOOK_SECRET != ''
+        run: |
+          python3 scripts/seed_cases_to_worker.py \
+            --test-cases test_cases.json \
+            --run-id "${{ github.event.client_payload.run_id }}"
+        env:
+          WORKER_URL: ${{ secrets.WORKER_URL }}
+          INTERNAL_WEBHOOK_SECRET: ${{ secrets.INTERNAL_WEBHOOK_SECRET }}
+
       # ── CREATE TEST RUN ──────────────────────────────────────────────────
       - name: Create test run in Qase
         if: github.event.action == 'slack_create_test_run'
